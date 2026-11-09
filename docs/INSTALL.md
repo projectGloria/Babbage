@@ -1,0 +1,305 @@
+# Install & build
+
+## Prebuilt bundles
+
+Download from [Releases](https://github.com/yjid/babbage/releases).
+
+| Platform | Asset | Notes |
+|---|---|---|
+| Linux | `babbage_<ver>_amd64.AppImage` | chmod +x and run; no install needed |
+| Linux | `babbage_<ver>_amd64.deb` | `sudo apt install ./babbage_*.deb` |
+| Linux | `babbage-<ver>-1.x86_64.rpm` | `sudo rpm -i babbage-*.rpm` |
+| macOS | `babbage_<ver>_universal.dmg` | Intel + Apple Silicon |
+| Windows | `babbage_<ver>_x64-setup.exe` or `babbage_<ver>_x64_en-US.msi` | per-user install |
+| Windows | `babbage-portable-<ver>-x64.zip` | portable: unzip in a writable folder, run `babbage.exe`; config/index/data live in `data\` next to the exe, nothing in `%APPDATA%`. Keeps the `portable` marker file in place. |
+| Windows on ARM | `babbage_<ver>_arm64-setup.exe`, `babbage_<ver>_arm64_en-US.msi`, `babbage-portable-<ver>-arm64.zip`, `babbage-cli-windows-aarch64.exe` | native ARM64 (Snapdragon) builds; same layout as x64 |
+| Agent CLI | `babbage-cli-{linux,macos,windows}-*` | Standalone CLI/MCP binary for each platform. |
+
+### The builds are unsigned
+
+This is the honest trade-off for a project without a paid signing identity yet.
+
+**macOS.** Gatekeeper will block the first launch. Either right-click the app →
+**Open** → **Open**, or clear the quarantine flag:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/Babbage.app
+```
+
+**Windows.** SmartScreen shows "Windows protected your PC". Choose **More info** →
+**Run anyway**.
+
+**Linux.** No signing step; AppImage may need `--no-sandbox` on hardened distros.
+
+If your organization requires signed binaries, build from source or wait for
+notarized releases. Verify downloads with the published `SHA256SUMS`.
+
+---
+
+## Build prerequisites
+
+### All platforms
+
+- Rust stable (edition 2024)
+- [Bun](https://bun.sh) 1.1+ (recommended); Node.js 20.19+ also works with npm
+- Git
+
+### Linux (Debian/Ubuntu)
+
+```bash
+sudo apt update
+sudo apt install -y \
+  libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev \
+  patchelf libgtk-3-dev build-essential curl wget file
+```
+
+Fedora:
+
+```bash
+sudo dnf install webkit2gtk4.1-devel libappindicator-gtk3-devel \
+  librsvg2-devel patchelf gtk3-devel
+```
+
+Arch:
+
+```bash
+sudo pacman -S webkit2gtk-4.1 libappindicator-gtk3 librsvg patchelf gtk3 base-devel
+```
+
+### macOS
+
+```bash
+xcode-select --install
+```
+
+### Windows
+
+- [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
+  with **Desktop development with C++**
+- WebView2 runtime (preinstalled on Windows 10/11)
+
+---
+
+## Build
+
+```bash
+git clone https://github.com/yjid/babbage
+cd babbage
+bun install
+
+bun run tauri dev        # dev app
+bun run tauri build      # bundles into src-tauri/target/release/bundle/
+```
+
+Bundle outputs:
+
+- Linux: `bundle/appimage/`, `bundle/deb/`, `bundle/rpm/`
+- macOS: `bundle/dmg/`, `bundle/macos/`
+- Windows: `bundle/msi/`, `bundle/nsis/`
+
+The release workflow (`.github/workflows/release.yml`) builds all three platforms
+on a `v*` tag and uploads a draft release.
+
+---
+
+## Development tasks
+
+A `Makefile` wraps the common commands:
+
+```bash
+make            # list tasks
+make install    # dependencies (bun, npm fallback)
+make dev        # Tauri dev app
+make build      # release bundles
+make cli        # agent CLI
+make test       # Rust tests
+make check      # tsc + cargo check
+make fmt        # Rust fmt
+make bench BENCH_DIR=~/Projects
+make data-dir   # where config/index live
+make reset-index# delete index, keep settings
+make reset      # delete all Babbage data
+make clean      # remove build outputs
+```
+
+`reset` and `reset-index` delete immediately. Quit Babbage first.
+
+---
+
+## The agent CLI
+
+`babbage-cli` is a separate binary that shares the same index.
+
+```bash
+cargo build --release --manifest-path cli/Cargo.toml
+```
+
+Install it on your `PATH`:
+
+```bash
+# Linux / macOS
+install -m 755 cli/target/release/babbage-cli ~/.local/bin/babbage-cli
+
+# Windows (PowerShell)
+Copy-Item cli\target\release\babbage-cli.exe "$env:USERPROFILE\bin\"
+```
+
+Then point your MCP client at it:
+
+```json
+{
+  "mcpServers": {
+    "babbage": { "command": "babbage-cli", "args": ["mcp"] }
+  }
+}
+```
+
+If `babbage-cli` is not on `PATH`, use the absolute path in `command`.
+
+CLI binaries are published as **release assets** alongside the desktop bundles
+(`babbage-cli-linux-*`, `babbage-cli-macos-*`, `babbage-cli-windows-*`), and
+`SHA256SUMS` covers them. Build from source if you prefer.
+
+---
+
+## OCR
+
+OCR works out of the box. PP-OCRv6 tiny is compiled into normal builds via the
+default `accurate-ocr` feature, and its ~6.1 MB model pack is downloaded on first
+use. Installers bundle ONNX Runtime 1.31 (Windows, Apple silicon, Linux x64).
+Native macOS/Windows OCR is **not** implemented.
+
+In **Setup → Optional packs** and Settings → Search you pick one engine:
+
+| Engine | Download | Notes |
+|---|---|---|
+| PP-OCRv6 (`accurate`) | ~6.1 MB (detector 1.7 MB, recognizer 4.3 MB, dictionary 27 KB) | Default. Runs in-process on ONNX Runtime. |
+| Indra (`indra`) | ~27 MB (8 models) | Higher quality: deskew, orientation, multi-script routing. |
+| Tesseract (`tesseract`) | System package + `tessdata` | Fallback where ONNX cannot run (Intel Macs, `--no-default-features`). |
+
+Packs are verified against pinned SHA-256 checksums. Settings → Search shows the
+selected engine's status and lets you choose Tesseract languages. Doctor repeats
+the check. If the PP-OCR/Indra pack is missing, extraction falls back to
+Tesseract.
+
+Tesseract needs the binary **and** language data. Babbage can download
+`eng.traineddata` (~4 MB) into its own directory from setup, so you don't need
+root. A system install also works:
+
+```bash
+# Linux (Debian/Ubuntu)
+sudo apt install tesseract-ocr tesseract-ocr-eng
+
+# macOS
+brew install tesseract
+
+# Windows
+winget install UB-Mannheim.TesseractOCR
+```
+
+Models: PaddleOCR PP-OCRv6 tiny (Apache-2.0), published by PaddlePaddle; Indra
+weights by Datalab (indra-ocr), under a modified OpenRAIL-M license. The Rust
+ONNX wrapper is `paddleocr_rs_onnx` (MIT).
+
+---
+
+## First run
+
+1. Pick folders (Home, Projects, Documents, Downloads).
+2. Choose an exclusion preset (Developer / Creative / All-round).
+3. Set preferences: theme, interface language, window mode (Launcher is the
+   default; Desktop app is one click away), and the global shortcut. Click the
+   shortcut field and press the key combo; Esc cancels.
+4. Optionally download OCR data and the semantic model. Each button shows live
+   state (downloading, progress, ready, or the error).
+5. Start. The first scan shows live counts, a progress bar, and an ETA, then ends
+   with a Done summary; later launches are search-first and instant. You can
+   search while indexing runs.
+
+The index lives at:
+
+| OS | Path |
+|---|---|
+| Linux | `~/.config/babbage/` |
+| macOS | `~/Library/Application Support/babbage/` (config via dirs) |
+| Windows | `%APPDATA%\babbage\` |
+
+Contents: `config.json`, `metadata.db` (SQLite WAL), `index/` (Tantivy),
+`thumbs/`, optional `models/`, `ocr/`, `ocr-indra/`, `tessdata/`, `babbage.log`,
+and a failure-only `crash.log`.
+
+---
+
+## Reset
+
+Settings → About → **Reset everything** (type `RESET`) deletes the index,
+database, thumbnails, and config, then restarts. Downloaded OCR and model packs
+are kept unless you tick the box to remove them. Uninstall steps are
+[below](#uninstalling).
+
+## Linux
+
+Babbage ships as an AppImage, a `.deb`, and an `.rpm`. The build is tested on
+Ubuntu 22.04 (X11). Other desktops are not yet verified.
+
+### Set a quick shortcut
+
+Babbage's own Alt+Space shortcut may not work on Wayland, where desktops block
+global keys for apps. Instead, bind any key to this command:
+
+```
+babbage --toggle
+```
+
+`--toggle` shows the window if it's hidden and hides it if it's shown. If the
+app isn't running yet, it starts it.
+
+Use the full path to the app if `babbage` isn't on your PATH (for an AppImage,
+the path where you saved the file).
+
+- **GNOME:** Settings → Keyboard → View and Customize Shortcuts → Custom Shortcuts → `+`.
+  Name it "Babbage", set the command to `babbage --toggle`, then press your key.
+- **KDE Plasma:** System Settings → Shortcuts → Add New → Global Shortcut → Command/URL.
+  Set the trigger and the command `babbage --toggle`.
+- **sway:** add `bindsym $mod+space exec babbage --toggle` to `~/.config/sway/config`, then reload.
+- **i3:** add `bindsym $mod+space exec babbage --toggle` to `~/.config/i3/config`, then reload.
+- **Hyprland:** add `bind = SUPER, space, exec, babbage --toggle` to `~/.config/hypr/hyprland.conf`.
+
+Pick a key that no other app uses. Babbage doesn't change or reserve any keys.
+
+## Uninstalling
+
+Babbage keeps everything in one data folder, so an uninstall is two steps:
+remove the program, then remove the data. The second step is separate on
+purpose, because it holds your settings and index and it is not something an
+installer should delete without being asked.
+
+| Platform | Remove the program | Remove the data |
+|---|---|---|
+| Windows | Settings → Apps → Babbage → Uninstall | Removed by the uninstaller |
+| macOS | Drag Babbage out of Applications | `babbage --remove-data` |
+| Linux (deb/rpm) | `sudo apt remove babbage` / `sudo rpm -e babbage` | `babbage --remove-data` |
+| Linux (AppImage) | Delete the AppImage file | `babbage --remove-data` |
+
+If `babbage` is not on your PATH, run the same flag against the binary you
+launched, for example `./babbage.AppImage --remove-data`.
+
+`--remove-data` prints how much it freed. Quit Babbage first: it deletes all
+data, so it will not run while the files are open.
+
+On Windows the uninstaller also clears `%LOCALAPPDATA%\com.gochi.babbage` (webview
+data) and `%TEMP%\babbage-updates` (staged installers from the in-app
+updater). A **portable** install keeps its data in a `data` folder beside the
+executable. Delete that folder yourself; the uninstaller leaves it alone
+because it is inside a folder you chose.
+
+Nothing writes outside the data folder, the two locations above, and the
+autostart entry. There is no telemetry, no cloud storage and no registry state
+beyond that entry.
+
+### Reset instead of uninstalling
+
+Settings → About → **Reset everything** clears your settings, index and cached
+data and keeps the app installed. Downloaded OCR and model packs are kept by
+default, so search works again immediately; tick the box in the dialog to remove
+them too.

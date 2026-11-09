@@ -1,0 +1,59 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Babbage",
+  "version": "1.0.16",
+  "identifier": "com.babbage.desktop",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [],
+    "security": {
+      "csp": null,
+      "assetProtocol": {
+        "enable": true,
+        "scope": [
+          "$CONFIG/babbage/thumbs/**",
+          "$APPCONFIG/thumbs/**",
+          "$APPLOCALDATA/babbage/thumbs/**",
+          "$APPDATA/babbage/thumbs/**"
+        ]
+      }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "createUpdaterArtifacts": false,
+    "publisher": "Babbage",
+    "copyright": "Babbage",
+    "category": "Productivity",
+    "shortDescription": "Fast local search for files, content, documents and images.",
+    "longDescription": "Babbage indexes filenames, file contents, PDFs, Office documents and images into one local index. Completely local, no telemetry.",
+    "homepage": "",
+    "licenseFile": "../LICENSE",
+    "resources": [
+      "resources/**/*"
+    ],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "windows": {
+      "nsis": {
+        "installerHooks": "./nsis/hooks.nsh",
+        "installerIcon": "./icons/icon.ico",
+        "uninstallerIcon": "./icons/icon.ico"
+      }
+    },
+    "macOS": {
+      "infoPlist": "Info.plist"
+    }
+  }
+}
