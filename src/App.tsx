@@ -11,7 +11,6 @@ import {
   CommandOutput,
   InterpretationChip,
   Facets,
-  HomeData,
   BabbageConfig,
   DoctorReport,
 } from "./types";
@@ -19,7 +18,6 @@ import { SetupModal } from "./components/SetupModal";
 import { DuplicatesModal } from "./components/DuplicatesModal";
 import { SlashMenu, SlashCommand } from "./components/SlashMenu";
 import { ScopeMenu } from "./components/ScopeMenu";
-import { HomeView } from "./components/HomeView";
 import { ResultItem, ResultView } from "./components/ResultItem";
 import { Settings } from "./components/SettingsModal";
 import { FilterChips } from "./components/FilterChips";
@@ -83,12 +81,15 @@ function App() {
   const [isSetupComplete, setIsSetupComplete] = useState<boolean | null>(null);
   const [query, setQuery] = useState("");
 
-  // The window is recreated on every show, so restore the last query from Rust
-  // and keep it there as the user types.
+  // The window is recreated on every show, so restore the last search from
+  // Rust and keep it there as the user types. It comes back selected, so
+  // typing replaces it and nothing has to be cleared first.
   useEffect(() => {
     invoke<string>("last_query")
       .then((q) => {
-        if (q) setQuery(q);
+        if (!q) return;
+        setQuery(q);
+        requestAnimationFrame(() => inputRef.current?.select());
       })
       .catch(() => {});
   }, []);
@@ -102,7 +103,6 @@ function App() {
   const [hints, setHints] = useState<string[]>([]);
   const [interpretation, setInterpretation] = useState<InterpretationChip[]>([]);
   const [facets, setFacets] = useState<Facets | undefined>(undefined);
-  const [home, setHome] = useState<HomeData | null>(null);
   const [loadingMore, setLoadingMore] = useState(false);
   /* The query+sort whose response (or failure) has landed. While it differs
      from what is typed, the search is still in flight and an empty list means
@@ -233,34 +233,11 @@ function App() {
     checkSetup();
   }, [checkSetup]);
 
-  /* ---------------- home data ---------------- */
-
   const recordQuery = useCallback((q: string) => {
     const trimmed = q.trim();
     if (!trimmed || trimmed.startsWith("/")) return;
     invoke("record_recent_query", { query: trimmed }).catch(() => {});
   }, []);
-
-  const loadHome = useCallback(async () => {
-    try {
-      setHome(await invoke<HomeData>("get_home_data"));
-    } catch (err) {
-      console.error("Home data error:", err);
-    }
-  }, []);
-
-  const handleClearRecentQueries = useCallback(async () => {
-    try {
-      await invoke("clear_recent_queries");
-      setHome((prev) => (prev ? { ...prev, recent_queries: [] } : prev));
-    } catch (err) {
-      console.error("Failed to clear recent queries:", err);
-    }
-  }, []);
-
-  useEffect(() => {
-    if (isSetupComplete) loadHome();
-  }, [isSetupComplete, loadHome, indexingStatus?.is_indexing]);
 
   /* ---------------- indexing status (events, not polling) ---------------- */
 
@@ -302,7 +279,6 @@ function App() {
       setInterpretation([]);
       setFacets(undefined);
       setSelectedIndex(0);
-      loadHome();
       return;
     }
 
@@ -371,7 +347,7 @@ function App() {
     }, 40);
 
     return () => clearTimeout(timer);
-  }, [query, sort, isSetupComplete, loadHome]);
+  }, [query, sort, isSetupComplete, recordQuery]);
 
   // Fetch snippets only for rows that are actually visible (or the first 20
   // when IntersectionObserver is unavailable). Results are patched by path
@@ -744,41 +720,19 @@ function App() {
       }),
     [results, facetInclude, facetExclude],
   );
-  // The list keyboard navigation operates over — search results while a query
-  // is typed, otherwise the home screen's recent tiles. Home items are shaped
-  // as search results (no snippet, FileName match) so preview, details and
-  // open all share one code path with the search list.
+  // The list keyboard navigation operates over: the search results, and
+  // nothing while the field is empty.
   const hasQuery = query.trim() !== "";
-  const homeNavList = useMemo(
-    () =>
-      (home?.recent ?? []).slice(0, 18).map((item) => ({
-        path: item.path,
-        filename: item.filename,
-        snippet: null,
-        score: 0,
-        file_size: item.size,
-        modified: item.modified,
-        is_dir: item.is_dir,
-        match_type: "FileName" as const,
-      })),
-    [home],
-  );
-  const navList = hasQuery ? displayResults : homeNavList;
+  const navList = hasQuery ? displayResults : NO_RESULTS;
 
   /* Space previews only once the user has moved into the results with the
      arrow keys. Typing clears it, so Space still types a space in a query. */
   const navigatingRef = useRef(false);
-  /* Whether the user has entered the list with a navigation key. The home
-     tiles draw their focus ring only after this — at first paint the ring
-     would sit on tile 0 and the first Tab press would look like a no-op. */
-  const [navActive, setNavActive] = useState(false);
   useEffect(() => {
     navigatingRef.current = false;
-    setNavActive(false);
   }, [query]);
 
-  // Home and search are different lists: never carry a selection index
-  // across the boundary.
+  // Never carry a selection index across the empty-field boundary.
   useEffect(() => {
     setSelectedIndex(0);
   }, [hasQuery]);
@@ -898,7 +852,6 @@ function App() {
         const enteringFromSearch = !navigatingRef.current;
         e.preventDefault();
         navigatingRef.current = true;
-        setNavActive(true);
         // Tab walks the list linearly from the search field: the first press
         // lands on the first result, later presses step forward (Shift+Tab
         // back) with wrap. Grid geometry is deliberately ignored — Tab is
@@ -917,9 +870,7 @@ function App() {
         }
         // Grid view navigates by rows first: Up/Down jump a whole row,
         // Left/Right step within the row. List view stays linear with wrap.
-        // The home screen is always a linear walk — its tile grid is a
-        // different component, so the measured column count may be stale.
-        const grid = view === "grid" && hasQuery;
+        const grid = view === "grid";
         if (grid) {
           const cols = gridColumnCount();
           if (e.key === "ArrowLeft") {
@@ -1207,7 +1158,7 @@ function App() {
               )}
 
               {/* One control bar: category chips on the left, layout and save on the right. */}
-              {!isCommandMode && hasQuery && (
+              {!isCommandMode && (
                 <div className="fade-in flex shrink-0 items-center gap-2 px-3.5 pb-1.5">
                   <CategoryChips
                     results={results}
@@ -1223,6 +1174,11 @@ function App() {
                     onView={setResultView}
                     canSave={displayResults.length > 0}
                     onSave={() => setSaveOpen((v) => !v)}
+                    onPickSaved={(s) => {
+                      setQuery(s.query);
+                      if (s.sort) setSort(s.sort);
+                      inputRef.current?.focus();
+                    }}
                   />
                 </div>
               )}
@@ -1247,7 +1203,6 @@ function App() {
                         await invoke("save_config", { config: cfg });
                         setSaveName("");
                         setSaveOpen(false);
-                        loadHome();
                       } catch (err) {
                         console.error(err);
                       }
@@ -1268,7 +1223,6 @@ function App() {
                         await invoke("save_config", { config: cfg });
                         setSaveName("");
                         setSaveOpen(false);
-                        loadHome();
                       } catch (err) {
                         console.error(err);
                       }
@@ -1404,21 +1358,7 @@ function App() {
                       </div>
                     </div>
                   ) : null
-                  ) : (
-                    <HomeView
-                      data={home}
-                      recentQueries={home?.recent_queries}
-                      onClearRecentQueries={handleClearRecentQueries}
-                      onOpen={(path) => handleOpenFile(path)}
-                      showThumbs={showThumbs}
-                      focusIndex={hasQuery || !navActive ? null : selectedIndex}
-                      onSearch={(q) => {
-                        recordQuery(q);
-                        setQuery(q);
-                        inputRef.current?.focus();
-                      }}
-                    />
-                  )}
+                  ) : null}
 
                 </div>
               </div>
@@ -1452,6 +1392,10 @@ function SuggestChip({ label, onClick }: { label: string; onClick: () => void })
     </button>
   );
 }
+
+/* Stable empty list so an empty field doesn't hand keyboard nav a new array
+   on every render. */
+const NO_RESULTS: SearchResult[] = [];
 
 function hasActiveFilters(q: string): boolean {
   return /\b(type|ext|in|modified|size):/i.test(q);

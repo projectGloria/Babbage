@@ -6,7 +6,9 @@
 //! Rust so the search comes back where the user left it.
 
 use std::collections::VecDeque;
+use std::path::Path;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent};
 
 pub const LABEL: &str = "main";
@@ -14,11 +16,58 @@ pub const LABEL: &str = "main";
 static LAST_QUERY: Mutex<String> = Mutex::new(String::new());
 static RECENT_QUERIES: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
 
+/// Set once the on-disk copy has been read (or found absent), so a missing
+/// file is not looked for again on every window open.
+static LAST_QUERY_LOADED: AtomicBool = AtomicBool::new(false);
+
+const LAST_QUERY_FILE: &str = "last_query.txt";
+/// A query longer than this is not something a person typed; ignore the file.
+const LAST_QUERY_MAX_BYTES: u64 = 4096;
+
+/// Whether `query` is a search worth reopening on. An emptied field and a
+/// slash command are not: the window should open on the last real search.
+fn is_restorable(query: &str) -> bool {
+    let trimmed = query.trim();
+    !trimmed.is_empty() && !trimmed.starts_with('/') && !trimmed.starts_with('>')
+}
+
 pub fn remember_query(query: &str) {
+    if !is_restorable(query) {
+        return;
+    }
     if let Ok(mut q) = LAST_QUERY.lock() {
         q.clear();
         q.push_str(query);
     }
+}
+
+fn read_last_query(path: &Path) -> Option<String> {
+    if std::fs::metadata(path).ok()?.len() > LAST_QUERY_MAX_BYTES {
+        return None;
+    }
+    let text = std::fs::read_to_string(path).ok()?;
+    let line = text.lines().next().unwrap_or_default();
+    is_restorable(line).then(|| line.to_string())
+}
+
+fn write_last_query(path: &Path, query: &str) {
+    if !is_restorable(query) {
+        return;
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, query);
+}
+
+/// Writes the last search to disk so the next launch opens on it. Called when
+/// the window is hidden and when the app exits, not per keystroke.
+pub fn persist_last_query() {
+    let query = LAST_QUERY.lock().map(|q| q.clone()).unwrap_or_default();
+    write_last_query(
+        &crate::config::BabbageConfig::config_dir().join(LAST_QUERY_FILE),
+        &query,
+    );
 }
 
 pub fn record_recent_query(query: &str) {
@@ -69,7 +118,18 @@ pub fn clear_recent_queries() {
 }
 
 pub fn last_query() -> String {
-    LAST_QUERY.lock().map(|q| q.clone()).unwrap_or_default()
+    let Ok(mut q) = LAST_QUERY.lock() else {
+        return String::new();
+    };
+    // First open after a launch: nothing typed yet, so fall back to what the
+    // previous run left on disk.
+    if q.is_empty() && !LAST_QUERY_LOADED.swap(true, Ordering::Relaxed) {
+        let path = crate::config::BabbageConfig::config_dir().join(LAST_QUERY_FILE);
+        if let Some(saved) = read_last_query(&path) {
+            *q = saved;
+        }
+    }
+    q.clone()
 }
 
 fn existing(app: &AppHandle) -> Option<WebviewWindow> {
@@ -199,6 +259,7 @@ pub fn show(app: &AppHandle) {
 
 /// Hides the search window by destroying it, then returns freed memory.
 pub fn hide(app: &AppHandle) {
+    persist_last_query();
     if let Some(window) = existing(app) {
         // Hide first, then destroy: on Windows, tearing down a visible
         // transparent + always-on-top window while WebView2 crashes out (the
@@ -240,6 +301,38 @@ pub fn release_free_memory() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn last_query_file_round_trips_and_skips_what_is_not_a_search() {
+        let dir = std::env::temp_dir().join(format!(
+            "babbage-last-query-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        let path = dir.join(LAST_QUERY_FILE);
+
+        assert_eq!(read_last_query(&path), None, "no file yet");
+
+        write_last_query(&path, "Nihil.cfg");
+        assert_eq!(read_last_query(&path).as_deref(), Some("Nihil.cfg"));
+
+        // An emptied field or a slash command never replaces the last search.
+        write_last_query(&path, "");
+        write_last_query(&path, "   ");
+        write_last_query(&path, "/reindex");
+        assert_eq!(read_last_query(&path).as_deref(), Some("Nihil.cfg"));
+
+        // A file that is not a plausible query is ignored, not restored.
+        std::fs::write(&path, "x".repeat(LAST_QUERY_MAX_BYTES as usize + 1)).unwrap();
+        assert_eq!(read_last_query(&path), None);
+        std::fs::write(&path, "/doctor").unwrap();
+        assert_eq!(read_last_query(&path), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn recent_queries_records_deduplicates_and_caps_at_five() {

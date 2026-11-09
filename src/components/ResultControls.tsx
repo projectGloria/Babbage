@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { Bookmark, Check, ChevronDown, LayoutGrid, Rows3 } from "lucide-react";
+import { invoke } from "@tauri-apps/api/core";
+import { ArrowUpDown, Bookmark, Check, ChevronDown, LayoutGrid, List, Rows3, X } from "lucide-react";
+import type { BabbageConfig, SavedSearch } from "../types";
 
 /* Right side of the toolbar: sort, layout, save. Same capsule material as
    the category segments.
@@ -19,6 +21,7 @@ export function ResultControls({
   onView,
   onSave,
   canSave,
+  onPickSaved,
 }: {
   sort: string;
   onSort: (value: string) => void;
@@ -26,6 +29,7 @@ export function ResultControls({
   onView: (v: "grid" | "list") => void;
   onSave: () => void;
   canSave: boolean;
+  onPickSaved: (saved: SavedSearch) => void;
 }) {
   const { t } = useTranslation("search");
   const SORT_OPTIONS = [
@@ -77,6 +81,48 @@ export function ResultControls({
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
+
+  /* Saved searches. Read from config each time the list opens, so a search
+     saved a moment ago is already there. */
+  const [savedOpen, setSavedOpen] = useState(false);
+  const [saved, setSaved] = useState<SavedSearch[]>([]);
+  const savedWrapRef = useRef<HTMLDivElement>(null);
+
+  const toggleSaved = async () => {
+    if (savedOpen) {
+      setSavedOpen(false);
+      return;
+    }
+    try {
+      const cfg = await invoke<BabbageConfig>("get_config");
+      setSaved(cfg.saved_searches ?? []);
+    } catch (err) {
+      console.error("Saved searches error:", err);
+      setSaved([]);
+    }
+    setSavedOpen(true);
+  };
+
+  const removeSaved = async (index: number) => {
+    try {
+      const cfg = await invoke<BabbageConfig>("get_config");
+      const next = (cfg.saved_searches ?? []).filter((_, i) => i !== index);
+      cfg.saved_searches = next;
+      await invoke("save_config", { config: cfg });
+      setSaved(next);
+    } catch (err) {
+      console.error("Remove saved search error:", err);
+    }
+  };
+
+  useEffect(() => {
+    if (!savedOpen) return;
+    const onDown = (e: MouseEvent) => {
+      if (!savedWrapRef.current?.contains(e.target as Node)) setSavedOpen(false);
+    };
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [savedOpen]);
 
   const choose = (value: string) => {
     onSort(value);
@@ -135,6 +181,7 @@ export function ResultControls({
           onClick={() => setOpen((v) => !v)}
           className="control flex h-[38px] cursor-pointer items-center gap-1.5 rounded-control pl-3.5 pr-3 text-[13px] font-medium text-fg outline-none"
         >
+          <ArrowUpDown className="h-3.5 w-3.5 shrink-0 text-muted" strokeWidth={1.75} />
           <span className="max-w-[110px] truncate">{selected.label}</span>
           <ChevronDown
             className={`h-3.5 w-3.5 shrink-0 text-subtle transition-transform ${open ? "rotate-180" : ""}`}
@@ -186,11 +233,74 @@ export function ResultControls({
         </button>
       </div>
 
-      {canSave && (
-        <button type="button" title={t("saveSearch")} aria-label={t("saveSearch")} onClick={onSave} className="control flex h-[38px] w-[38px] items-center justify-center rounded-control text-muted transition-colors hover:text-fg">
-          <Bookmark className="h-4 w-4" strokeWidth={1.75} />
-        </button>
-      )}
+      {/* Save and saved share one capsule: no gap, no divider. The popover
+          hangs off the wrapper, not the capsule, because `.control` isolates
+          its stacking context and the results would paint over the list. */}
+      <div ref={savedWrapRef} className="relative">
+        <div className="control flex h-[38px] items-center rounded-control">
+          {canSave && (
+            <button type="button" title={t("saveSearch")} aria-label={t("saveSearch")} onClick={onSave} className="flex h-full w-9 items-center justify-center rounded-control text-muted transition-colors hover:text-fg">
+              <Bookmark className="h-4 w-4" strokeWidth={1.75} />
+            </button>
+          )}
+          <button
+            type="button"
+            aria-haspopup="menu"
+            aria-expanded={savedOpen}
+            title={t("savedSearches")}
+            aria-label={t("savedSearches")}
+            onClick={toggleSaved}
+            className={`flex h-full w-9 items-center justify-center rounded-control transition-colors hover:text-fg ${savedOpen ? "text-fg" : "text-muted"}`}
+          >
+            <List className="h-4 w-4" strokeWidth={1.75} />
+          </button>
+        </div>
+
+        {savedOpen && (
+          <div
+            role="menu"
+            aria-label={t("savedSearches")}
+            onKeyDown={(e) => {
+              if (e.key !== "Escape") return;
+              e.preventDefault();
+              e.stopPropagation();
+              setSavedOpen(false);
+            }}
+            className="menu-pop elevated absolute right-0 z-[70] mt-1.5 max-h-[280px] w-[240px] overflow-y-auto p-1"
+          >
+            {saved.length === 0 ? (
+              <p className="px-2.5 py-2 text-[13px] text-subtle">{t("noSavedSearches")}</p>
+            ) : (
+              saved.map((s, i) => (
+                <div key={`${s.name}\u0000${i}`} className="group flex items-center">
+                  <button
+                    type="button"
+                    role="menuitem"
+                    title={s.query}
+                    onClick={() => {
+                      setSavedOpen(false);
+                      onPickSaved(s);
+                    }}
+                    className="menu-row min-w-0 flex-1"
+                    style={{ textAlign: "left" }}
+                  >
+                    <span className="truncate">{s.name}</span>
+                  </button>
+                  <button
+                    type="button"
+                    title={t("removeSavedSearch")}
+                    aria-label={t("removeSavedSearch")}
+                    onClick={() => removeSaved(i)}
+                    className="flex h-8 w-7 shrink-0 items-center justify-center text-subtle opacity-0 transition-[color,opacity] hover:text-danger focus-visible:opacity-100 group-hover:opacity-100"
+                  >
+                    <X className="h-3.5 w-3.5" strokeWidth={2} />
+                  </button>
+                </div>
+              ))
+            )}
+          </div>
+        )}
+      </div>
     </div>
   );
 }

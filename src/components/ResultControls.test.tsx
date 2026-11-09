@@ -15,9 +15,16 @@ vi.mock("react-i18next", () => ({
   useTranslation: () => ({ t: (key: string) => key }),
 }));
 
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: async () => ({
+    saved_searches: [{ name: "Invoices", query: "invoice type:pdf", sort: "newest" }],
+  }),
+}));
+
+import type { SavedSearch } from "../types";
 import { ResultControls } from "./ResultControls";
 
-function renderControls() {
+function renderControls(onPickSaved: (s: SavedSearch) => void = () => undefined) {
   const container = document.createElement("div");
   document.body.appendChild(container);
   const root = createRoot(container);
@@ -33,6 +40,7 @@ function renderControls() {
           onView={() => undefined}
           onSave={() => undefined}
           canSave={true}
+          onPickSaved={onPickSaved}
         />
       </div>,
     );
@@ -88,6 +96,7 @@ describe("ResultControls", () => {
               onView={() => undefined}
               onSave={() => undefined}
               canSave={true}
+              onPickSaved={() => undefined}
             />
           </div>,
         );
@@ -126,6 +135,26 @@ describe("ResultControls", () => {
 
     expect(trigger.getAttribute("aria-expanded")).toBe("false");
     expect(document.activeElement).toBe(trigger);
+
+    cleanup();
+  });
+
+  it("lists saved searches and hands the picked one back", async () => {
+    const picked: SavedSearch[] = [];
+    const { container, cleanup } = renderControls((s) => picked.push(s));
+
+    const trigger = container.querySelector(
+      'button[aria-haspopup="menu"]',
+    ) as HTMLButtonElement;
+    expect(trigger).toBeTruthy();
+
+    await act(async () => trigger.click());
+    const item = container.querySelector('[role="menuitem"]') as HTMLButtonElement;
+    expect(item.textContent).toBe("Invoices");
+
+    act(() => item.click());
+    expect(picked).toEqual([{ name: "Invoices", query: "invoice type:pdf", sort: "newest" }]);
+    expect(container.querySelector('[role="menu"]')).toBeNull();
 
     cleanup();
   });

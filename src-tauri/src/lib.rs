@@ -667,8 +667,12 @@ pub fn run() {
             // Destroying the search window (hide) must not end the app. The
             // indexer, watcher and tray keep running. Only the tray's Quit
             // (app.exit) ends it, and that call is not prevented here.
-            if let tauri::RunEvent::ExitRequested { api, code: None, .. } = event {
-                api.prevent_exit();
+            match event {
+                tauri::RunEvent::ExitRequested { api, code: None, .. } => api.prevent_exit(),
+                // Quit with the window still open: `hide` never ran, so the
+                // last search has not been written yet.
+                tauri::RunEvent::Exit => main_window::persist_last_query(),
+                _ => {}
             }
         });
 }
