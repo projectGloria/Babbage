@@ -40,6 +40,7 @@
   "tryPdf": "试试 type:pdf",
   "onlyFolders": "只看文件夹",
   "noResultsNothing": "还没有名为 {{query}} 的结果。",
+  "searching": "正在搜索",
   "settingsTitle": "设置",
   "toast": { "pathCopied": "已复制路径" },
   "filters": {

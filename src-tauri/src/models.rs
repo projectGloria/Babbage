@@ -365,16 +365,16 @@ pub fn models_dir() -> PathBuf {
     if user_dir.join("model.safetensors").is_file() {
         return user_dir;
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let bundled = dir.join("resources").join("models");
-            if bundled.join("model.safetensors").is_file() {
-                return bundled;
-            }
-            let direct = dir.join("models");
-            if direct.join("model.safetensors").is_file() {
-                return direct;
-            }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let bundled = dir.join("resources").join("models");
+        if bundled.join("model.safetensors").is_file() {
+            return bundled;
+        }
+        let direct = dir.join("models");
+        if direct.join("model.safetensors").is_file() {
+            return direct;
         }
     }
     user_dir

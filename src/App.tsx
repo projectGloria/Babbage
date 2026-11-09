@@ -104,6 +104,10 @@ function App() {
   const [facets, setFacets] = useState<Facets | undefined>(undefined);
   const [home, setHome] = useState<HomeData | null>(null);
   const [loadingMore, setLoadingMore] = useState(false);
+  /* The query+sort whose response (or failure) has landed. While it differs
+     from what is typed, the search is still in flight and an empty list means
+     "not yet", not "nothing". */
+  const [settledKey, setSettledKey] = useState<string | null>(null);
   const [saveOpen, setSaveOpen] = useState(false);
   const [saveName, setSaveName] = useState("");
   const [facetInclude, setFacetInclude] = useState<Set<string>>(new Set());
@@ -343,6 +347,7 @@ function App() {
             }
           }
           resultsQueryRef.current = query.trim();
+          setSettledKey(`${query.trim()}\u0000${sort}`);
           setResults(merged);
           setTotal(res.total ?? merged.length);
           setActiveFilters(res.active_filters);
@@ -360,6 +365,8 @@ function App() {
         }
       } catch (err) {
         console.error("Search error:", err);
+        // A failed search is over too; don't leave "Searching" up forever.
+        if (seq >= currentSeqRef.current) setSettledKey(`${query.trim()}\u0000${sort}`);
       }
     }, 40);
 
@@ -1087,6 +1094,8 @@ function App() {
 
   const isCommandMode = query.trim().startsWith("/");
 
+  const searchPending =
+    hasQuery && !isCommandMode && settledKey !== `${query.trim()}\u0000${sort}`;
   const noResults = hasQuery && !isCommandMode && displayResults.length === 0;
 
   return (
@@ -1154,6 +1163,7 @@ function App() {
                 onFocusInput={() => {}}
                 resultCount={results.length}
                 total={total}
+                searching={searchPending}
                 trailing={
                   <button
                     type="button"
@@ -1352,7 +1362,23 @@ function App() {
                         )
                       }
                     />
-                  ) : hasQuery ? (noResults ? (
+                  ) : hasQuery ? (noResults && searchPending ? (
+                    /* Delayed fade so a fast search never flashes this. */
+                    <div
+                      className="fade-in flex h-full flex-col items-start justify-end px-4 pb-8 select-none"
+                      style={{ animationDelay: "150ms" }}
+                      role="status"
+                    >
+                      <p className="t-moment max-w-lg text-muted">
+                        {t("searching")}
+                        <span aria-hidden="true">
+                          <span className="dot-pulse">.</span>
+                          <span className="dot-pulse" style={{ animationDelay: "200ms" }}>.</span>
+                          <span className="dot-pulse" style={{ animationDelay: "400ms" }}>.</span>
+                        </span>
+                      </p>
+                    </div>
+                  ) : noResults ? (
                     <div className="flex h-full flex-col items-start justify-end gap-4 px-4 pb-8 select-none">
                       <p className="t-moment rise-in max-w-lg text-muted">
                         {t("noResultsNothing", { query: query.trim() })}

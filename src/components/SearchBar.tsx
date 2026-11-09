@@ -14,6 +14,8 @@ interface SearchBarProps {
   resultCount: number;
   /** Total matches before the display limit, when known. */
   total?: number;
+  /** A search is still in flight; an empty count is not "No results" yet. */
+  searching?: boolean;
   /** Icon buttons rendered at the right end of the capsule (settings). */
   trailing?: React.ReactNode;
 }
@@ -25,6 +27,7 @@ export function SearchBar({
   onFocusInput,
   resultCount,
   total,
+  searching,
   trailing,
 }: SearchBarProps) {
   const [phIdx, setPhIdx] = useState(0);
@@ -73,7 +76,7 @@ export function SearchBar({
           style={{ caretColor: "var(--blue)" }}
         />
 
-        {query && !isCommandMode && (
+        {query && !isCommandMode && !(searching && count === 0) && (
           <span key={count} className="t-meta fade-in shrink-0 text-subtle">
             {count === 0 ? t("empty.noResults") : t("resultCount", { count })}
           </span>

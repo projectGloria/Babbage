@@ -23,8 +23,26 @@ pub fn compute_char_mask(text: &str) -> u64 {
     mask
 }
 
+/// Lowercased whitespace-separated query terms for the literal check, or
+/// `None` when the query uses nucleo atom syntax (`!x`, `^x`, `'x`, `x$`)
+/// whose meaning is not "contains this text".
+fn literal_terms(query: &str) -> Option<Vec<String>> {
+    let mut terms = Vec::new();
+    for atom in query.split_whitespace() {
+        if atom.starts_with(['!', '^', '\'']) || atom.ends_with('$') {
+            return None;
+        }
+        // Either separator matches either: `src/app` finds `src\app`.
+        terms.push(atom.to_lowercase().replace('\\', "/"));
+    }
+    (!terms.is_empty()).then_some(terms)
+}
+
 /// Scores one entry for a parsed pattern. Callers provide the matcher and
 /// scratch buffer so parallel workers can keep their own state.
+///
+/// The flag is true when every query term appears verbatim (case-insensitive)
+/// in the path, as opposed to a scattered subsequence match.
 fn score_entry(
     pattern: &Pattern,
     matcher: &mut Matcher,
@@ -32,7 +50,8 @@ fn score_entry(
     entry: &FileEntry,
     query_mask: u64,
     match_path: bool,
-) -> Option<u32> {
+    literal_terms: Option<&[String]>,
+) -> Option<(u32, bool)> {
     // Char-bloom prefilter: 64-bit letter mask per name.
     if !match_path && (entry.char_bloom & query_mask) != query_mask {
         return None;
@@ -44,7 +63,12 @@ fn score_entry(
     if let Some(name_score) = pattern.score(name_utf32, matcher) {
         final_score += name_score * 2;
     }
-    Some(final_score)
+    // Only entries nucleo already accepted pay for the lowercase copy.
+    let literal = literal_terms.is_some_and(|terms| {
+        let haystack = path_str.to_lowercase().replace('\\', "/");
+        terms.iter().all(|term| haystack.contains(term.as_str()))
+    });
+    Some((final_score, literal))
 }
 
 pub struct FuzzySearcher {
@@ -77,23 +101,35 @@ impl FuzzySearcher {
         }
 
         let pattern = Pattern::parse(trimmed, CaseMatching::Ignore, Normalization::Smart);
-        let query_mask = compute_char_mask(trimmed);
+        // Whitespace separates terms and is never matched, so it must not be
+        // required of the name: `vite config` has to reach `vite.config.ts`.
+        let mask_text: String = trimmed.chars().filter(|c| !c.is_whitespace()).collect();
+        let query_mask = compute_char_mask(&mask_text);
         let match_path = trimmed.contains('/') || trimmed.contains('\\');
+        let literal_terms = literal_terms(trimmed);
+        let literal_terms = literal_terms.as_deref();
 
         // Large candidate sets (1M-file corpora) are scored across the rayon
         // pool; small ones stay sequential so a keystroke never pays
         // scheduling overhead.
         const PARALLEL_THRESHOLD: usize = 20_000;
-        let mut scored_indices: Vec<(usize, u32)> = if candidate_indices.len() >= PARALLEL_THRESHOLD
-        {
+        let scored: Vec<(usize, u32, bool)> = if candidate_indices.len() >= PARALLEL_THRESHOLD {
             candidate_indices
                 .par_iter()
                 .map_init(
                     || (Matcher::new(Config::DEFAULT.match_paths()), Vec::new()),
                     |(matcher, char_buf), &orig_idx| {
                         all_entries.get(orig_idx).and_then(|entry| {
-                            score_entry(&pattern, matcher, char_buf, entry, query_mask, match_path)
-                                .map(|score| (orig_idx, score))
+                            score_entry(
+                                &pattern,
+                                matcher,
+                                char_buf,
+                                entry,
+                                query_mask,
+                                match_path,
+                                literal_terms,
+                            )
+                            .map(|(score, literal)| (orig_idx, score, literal))
                         })
                     },
                 )
@@ -106,19 +142,32 @@ impl FuzzySearcher {
                 let Some(entry) = all_entries.get(orig_idx) else {
                     continue;
                 };
-                if let Some(score) = score_entry(
+                if let Some((score, literal)) = score_entry(
                     &pattern,
                     &mut self.matcher,
                     &mut char_buf,
                     entry,
                     query_mask,
                     match_path,
+                    literal_terms,
                 ) {
-                    scored.push((orig_idx, score));
+                    scored.push((orig_idx, score, literal));
                 }
             }
             scored
         };
+
+        // Someone typing `nihil.cfg` wants that file, not every path whose
+        // letters happen to contain n-i-h-i-l-.-c-f-g in order. When anything
+        // matches the query verbatim, the scattered subsequence matches are
+        // dropped; they stay as the typo/abbreviation fallback for queries
+        // with no verbatim match at all.
+        let any_literal = scored.iter().any(|&(_, _, literal)| literal);
+        let mut scored_indices: Vec<(usize, u32)> = scored
+            .into_iter()
+            .filter(|&(_, _, literal)| literal || !any_literal)
+            .map(|(idx, score, _)| (idx, score))
+            .collect();
 
         // Top-k heap/selection using select_nth_unstable: O(N) instead of O(N log N)
         if scored_indices.len() > limit {
@@ -218,6 +267,67 @@ mod tests {
                 "query {query:?}: expected {expected} in top 3, got {top_three:?}"
             );
         }
+    }
+
+    fn names(entries: &[FileEntry], results: &[(usize, u32)]) -> Vec<String> {
+        results
+            .iter()
+            .map(|&(idx, _)| entries[idx].name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn verbatim_match_drops_scattered_subsequence_matches() {
+        // Every path contains n-i-h-i-l-.-c-f-g in order; only one contains
+        // the text itself.
+        let entries: Vec<FileEntry> = [
+            "C:/Users/Nihil/csgo/cfg/Nihil.cfg",
+            "C:/Users/Nihil/Desktop/Vestigium/playwright.config.ts",
+            "C:/Users/Nihil/Music/You Shall Never Have To Forgive Me Again.flac",
+            "C:/Platform/Microsoft.DiagnosticsHub.VisualStudio.Package.vsdconfig",
+        ]
+        .into_iter()
+        .map(entry)
+        .collect();
+        let candidates: Vec<usize> = (0..entries.len()).collect();
+        let mut searcher = FuzzySearcher::new();
+
+        let results = searcher.search("nihil.cfg", &entries, &candidates, 50);
+        assert_eq!(
+            names(&entries, &results),
+            ["C:/Users/Nihil/csgo/cfg/Nihil.cfg"]
+        );
+    }
+
+    #[test]
+    fn scattered_matches_remain_the_fallback_without_a_verbatim_match() {
+        let entries = fixture();
+        let candidates: Vec<usize> = (0..entries.len()).collect();
+        let mut searcher = FuzzySearcher::new();
+
+        // No path contains "crgtml"; the abbreviation still finds Cargo.toml.
+        let results = searcher.search("crgtml", &entries, &candidates, 50);
+        assert!(
+            names(&entries, &results).contains(&"repo/Cargo.toml".to_string()),
+            "abbreviation lost its fuzzy fallback: {:?}",
+            names(&entries, &results)
+        );
+    }
+
+    #[test]
+    fn multi_word_query_matches_a_name_without_spaces() {
+        // Real entries carry the bare file name, and the prefilter runs on it.
+        let mut vite = entry("repo/vite.config.ts");
+        vite.name = "vite.config.ts".to_string();
+        vite.char_bloom = compute_char_mask(&vite.name);
+        let mut ts = entry("repo/tsconfig.json");
+        ts.name = "tsconfig.json".to_string();
+        ts.char_bloom = compute_char_mask(&ts.name);
+        let entries = vec![vite, ts];
+        let mut searcher = FuzzySearcher::new();
+
+        let results = searcher.search("vite config", &entries, &[0, 1], 50);
+        assert_eq!(names(&entries, &results), ["vite.config.ts"]);
     }
 
     #[test]

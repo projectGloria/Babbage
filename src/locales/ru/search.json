@@ -42,6 +42,7 @@
   "tryPdf": "Попробовать type:pdf",
   "onlyFolders": "Только папки",
   "noResultsNothing": "Пока ничего с именем {{query}}.",
+  "searching": "Поиск",
   "settingsTitle": "Настройки",
   "toast": { "pathCopied": "Путь скопирован" },
   "filters": {

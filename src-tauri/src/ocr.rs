@@ -41,25 +41,25 @@ static ENGINE: AtomicU8 = AtomicU8::new(0);
 /// Directory holding the optional PP-OCRv6 pack. `BABBAGE_OCR_PACK_DIR`
 /// overrides it (development and the real-model CI tests).
 pub fn pack_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("BABBAGE_OCR_PACK_DIR") {
-        if !dir.is_empty() {
-            return PathBuf::from(dir);
-        }
+    if let Some(dir) = std::env::var_os("BABBAGE_OCR_PACK_DIR")
+        && !dir.is_empty()
+    {
+        return PathBuf::from(dir);
     }
     let user_dir = BabbageConfig::config_dir().join("ocr");
     if user_dir.join("det.onnx").is_file() {
         return user_dir;
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let bundled = dir.join("resources").join("ocr");
-            if bundled.join("det.onnx").is_file() {
-                return bundled;
-            }
-            let direct = dir.join("ocr");
-            if direct.join("det.onnx").is_file() {
-                return direct;
-            }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let bundled = dir.join("resources").join("ocr");
+        if bundled.join("det.onnx").is_file() {
+            return bundled;
+        }
+        let direct = dir.join("ocr");
+        if direct.join("det.onnx").is_file() {
+            return direct;
         }
     }
     user_dir

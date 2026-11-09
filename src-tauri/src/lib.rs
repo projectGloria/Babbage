@@ -584,32 +584,36 @@ pub fn run() {
             }
 
             // 2. Setup System Tray
-            let show_item = MenuItem::with_id(app, "toggle", "Open Search", true, None::<&str>)?;
             let quit_item = MenuItem::with_id(app, "quit", "Quit Babbage", true, None::<&str>)?;
-            let tray_menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+            let tray_menu = Menu::with_items(app, &[&quit_item])?;
 
-            // Windows users expect a click on the tray icon to offer the
-            // menu (Open / Quit), and a double-click to open. Elsewhere a
-            // left click toggles the window and the menu is a right click.
+            // Left click opens search; the menu (Quit only) is a right click.
             let mut tray_builder = TrayIconBuilder::with_id("main")
                 .menu(&tray_menu)
                 .tooltip("Babbage")
-                .show_menu_on_left_click(cfg!(windows))
-                .on_menu_event(move |app, event| match event.id().as_ref() {
-                    "toggle" => main_window::toggle(app),
-                    "quit" => {
+                .show_menu_on_left_click(false)
+                .on_menu_event(move |app, event| {
+                    if event.id().as_ref() == "quit" {
                         app.exit(0);
                     }
-                    _ => {}
                 })
                 .on_tray_icon_event(|tray, event| match event {
                     // Click fires on press and on release. Acting on both
                     // toggled twice, so the window opened and closed again.
+                    // Windows shows rather than toggles: the click has already
+                    // blurred (and so hidden) a launcher window, and the
+                    // second half of a double-click would close it again.
                     TrayIconEvent::Click {
                         button: MouseButton::Left,
                         button_state: MouseButtonState::Up,
                         ..
-                    } if !cfg!(windows) => main_window::toggle(tray.app_handle()),
+                    } => {
+                        if cfg!(windows) {
+                            main_window::show(tray.app_handle());
+                        } else {
+                            main_window::toggle(tray.app_handle());
+                        }
+                    }
                     TrayIconEvent::DoubleClick {
                         button: MouseButton::Left,
                         ..

@@ -152,6 +152,18 @@ pub fn serve_on_listener(
     token: String,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), HttpError> {
+    serve_with_session(listener, token, shutdown, None)
+}
+
+/// `session` of `None` resolves the backend lazily on first use (daemon, else
+/// the on-disk index). Tests pass a fixed backend so they never open the
+/// index of whoever is running them.
+fn serve_with_session(
+    listener: TcpListener,
+    token: String,
+    shutdown: Arc<AtomicBool>,
+    session: Option<AgentSessionState>,
+) -> Result<(), HttpError> {
     eprintln!(
         "[Babbage HTTP] listening on http://{} (token: {})",
         listener
@@ -161,7 +173,7 @@ pub fn serve_on_listener(
     );
 
     let state = Arc::new(HttpState {
-        session: Mutex::new(None),
+        session: Mutex::new(session),
         token,
         shutdown,
         active: AtomicUsize::new(0),
@@ -640,7 +652,13 @@ mod tests {
         let handle_shutdown = Arc::clone(&shutdown);
         let serve_token = token.clone();
         std::thread::spawn(move || {
-            let _ = serve_on_listener(listener, serve_token, handle_shutdown);
+            // No backend: hermetic, and fast however large the real index
+            // on this machine is (opening it blew the 5 s read timeout).
+            let no_backend = AgentSessionState {
+                daemon: false,
+                index: None,
+            };
+            let _ = serve_with_session(listener, serve_token, handle_shutdown, Some(no_backend));
         });
         // Wait for the listener to accept.
         for _ in 0..100 {
@@ -742,10 +760,9 @@ mod tests {
         );
         assert_eq!(status, 200);
         let payload: Value = serde_json::from_str(&body).unwrap();
-        // `ok` depends on whether a real Babbage index exists on this
-        // machine; the contract under test is that /health answers with the
-        // standard shape either way.
-        assert!(payload["ok"].is_boolean());
+        // The test server has no backend, so health must say so while still
+        // answering with the standard shape.
+        assert_eq!(payload["ok"], false);
         assert!(payload["health"].is_object());
     }
 
