@@ -163,7 +163,7 @@ fn start_phash_backfill(
     content_index: Arc<RwLock<Option<ContentIndex>>>,
     visual_store: Arc<RwLock<crate::embed::visual::VisualStore>>,
     crawl_running: Arc<AtomicBool>,
-    query_in_flight: Arc<AtomicBool>,
+    query_in_flight: Arc<crate::util::pools::QueryFlag>,
 ) {
     if PHASH_BACKFILL_RUNNING.swap(true, Ordering::SeqCst) {
         return;
@@ -277,7 +277,7 @@ pub struct IndexerManager {
     pub unit_store: Arc<RwLock<UnitStore>>,
     pub visual_store: Arc<RwLock<crate::embed::visual::VisualStore>>,
     pub embedding_queue: Arc<Mutex<Option<EmbeddingQueue>>>,
-    pub query_in_flight: Arc<AtomicBool>,
+    pub query_in_flight: Arc<crate::util::pools::QueryFlag>,
     pub config: Arc<RwLock<BabbageConfig>>,
     pub status: Arc<RwLock<IndexingStatus>>,
     /// Unix timestamp (ms) when the current/last crawl started, 0 if none.
@@ -314,7 +314,7 @@ impl IndexerManager {
             crate::embed::visual::VISUAL_DIM,
             crate::embed::visual::MOCK_VISUAL_MODEL_ID,
         )));
-        let query_in_flight = Arc::new(AtomicBool::new(false));
+        let query_in_flight = Arc::new(crate::util::pools::QueryFlag::new());
 
         // Semantic state (the ~30 MB embedding table and the persisted unit
         // vectors) is only loaded when semantic search is actually enabled.
@@ -428,7 +428,7 @@ impl IndexerManager {
             crate::embed::visual::VISUAL_DIM,
             crate::embed::visual::MOCK_VISUAL_MODEL_ID,
         )));
-        let query_in_flight = Arc::new(AtomicBool::new(false));
+        let query_in_flight = Arc::new(crate::util::pools::QueryFlag::new());
 
         let mut units_count = 0;
         if let Some(db) = metadata_store.read().db() {
@@ -476,6 +476,29 @@ impl IndexerManager {
     }
 
     fn emit_status(app_handle: &Arc<RwLock<Option<tauri::AppHandle>>>, status: &IndexingStatus) {
+        // Progress updates fire every few files; on a fast text crawl that
+        // was hundreds of events per second, each re-rendering the root
+        // component. Counts are throttled to ~10 per second; any change of
+        // phase, indexing or paused state is always sent.
+        {
+            static LAST: Mutex<Option<(Instant, String, bool, bool)>> = Mutex::new(None);
+            let mut last = LAST.lock();
+            let state_changed = last.as_ref().is_none_or(|(_, phase, indexing, paused)| {
+                *phase != status.phase || *indexing != status.is_indexing || *paused != status.paused
+            });
+            let due = last
+                .as_ref()
+                .is_none_or(|(at, ..)| at.elapsed() >= Duration::from_millis(100));
+            if !state_changed && !due {
+                return;
+            }
+            *last = Some((
+                Instant::now(),
+                status.phase.clone(),
+                status.is_indexing,
+                status.paused,
+            ));
+        }
         if let Some(handle) = app_handle.read().as_ref() {
             // The launcher destroys its window when it hides, and the crawl
             // keeps running: emitting then posts to a dead HWND, which WebView2
@@ -535,17 +558,12 @@ impl IndexerManager {
     /// felt worst exactly when it was doing the most work. The phash backfill
     /// already yields this way; the extraction pool did not.
     ///
-    /// Polling rather than blocking on a condition variable: a flag left set
-    /// by a panic in the query path costs a slower crawl, never a hung one.
-    fn yield_to_queries(query_in_flight: &Arc<AtomicBool>) {
-        if !query_in_flight.load(Ordering::Relaxed) {
-            return;
-        }
-        // Long enough for the query to finish, short enough that the crawl
-        // resumes immediately after it.
-        while query_in_flight.load(Ordering::Relaxed) {
-            thread::sleep(Duration::from_millis(25));
-        }
+    /// The crawl runs on its own pool (`util::pools::crawl_pool`) and queries
+    /// on another, so sleeping here can never starve the query it waits for.
+    /// The flag is a guard-managed counter (cleared even if a query panics),
+    /// and the wait is capped so a slow query only slows the crawl.
+    fn yield_to_queries(query_in_flight: &crate::util::pools::QueryFlag) {
+        query_in_flight.wait_clear(Duration::from_millis(25), Duration::from_secs(2));
     }
 
     /// Eco mode limits how often extraction jobs start while on battery.
@@ -886,6 +904,16 @@ impl IndexerManager {
             let (tx, rx) = std::sync::mpsc::sync_channel::<ExtractedWork>(32);
             let image_db = metadata.read().db();
             let db_handle = metadata.read().db();
+            // The batch transaction is checkpointed at each content commit
+            // below. Every queued file is flagged pending in SQLite first and
+            // unflagged as its work lands, so a crash after a checkpoint
+            // re-extracts exactly the files that were not done, instead of
+            // either everything (one crawl-long transaction) or nothing
+            // (committed rows that look up to date).
+            if let Some(db) = db_handle.as_ref() {
+                let ids: Vec<u64> = to_extract.iter().map(|job| job.node_id).collect();
+                let _ = db.set_pending_by_ids(&ids, true);
+            }
             let thumbs_dir = BabbageConfig::config_dir().join("thumbs");
             // The producer task runs on the rayon pool and must own its handles;
             // the consumer (this thread) keeps using the originals.
@@ -896,7 +924,7 @@ impl IndexerManager {
             let pace_gate = Arc::new(Mutex::new(Instant::now()));
             let producer_query_flag = Arc::clone(&query_in_flight);
 
-            rayon::scope(|scope| {
+            crate::util::pools::crawl_pool().install(|| rayon::scope(|scope| {
                 use rayon::prelude::*;
 
                 scope.spawn(move |_| {
@@ -1055,6 +1083,12 @@ impl IndexerManager {
                         }
                     }
 
+                    if !work.retry
+                        && !pending_images.contains(&work.path)
+                        && let Some(db) = db_handle.as_ref()
+                    {
+                        let _ = db.set_pending_by_ids(&[work.node_id], false);
+                    }
                     if work.retry {
                         retry_paths.insert(work.path.clone());
                     } else if pending_images.contains(&work.path) && work.content.is_some() {
@@ -1096,13 +1130,16 @@ impl IndexerManager {
                         && let Some(c_index) = c_index
                     {
                         let _ = c_index.commit();
+                        if let Some(db) = db_handle.as_ref() {
+                            let _ = db.checkpoint_transaction();
+                        }
                         pending_commits = 0;
                         let mut st = status.write();
                         st.content_indexed = content_count;
                         Self::emit_status(&app_handle, &st);
                     }
                 }
-            });
+            }));
 
             {
                 let mut st = status.write();
@@ -1252,10 +1289,7 @@ impl IndexerManager {
                     let _ = c_index.remove_many(&stale_paths);
                 }
 
-                let mut store = metadata.write();
-                for path in &stale_paths {
-                    store.remove(path);
-                }
+                metadata.write().remove_many(&stale_paths);
                 crate::say!(
                     "[Babbage Indexer] Removed {} stale metadata entries",
                     stale_paths.len()

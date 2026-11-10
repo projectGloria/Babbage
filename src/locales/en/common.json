@@ -1,5 +1,7 @@
 {
-  "app": { "name": "Babbage" },
+  "app": {
+    "name": "Babbage"
+  },
   "actions": {
     "close": "Close",
     "cancel": "Cancel",
@@ -61,5 +63,10 @@
   "stepper": {
     "decrease": "Decrease",
     "increase": "Increase"
+  },
+  "window": {
+    "minimize": "Minimize",
+    "maximize": "Maximize",
+    "close": "Close window"
   }
 }

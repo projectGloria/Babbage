@@ -12,6 +12,22 @@ pub struct SemanticHit {
 
 pub struct ExactScanner;
 
+fn merge_best(
+    mut into: HashMap<u64, (f32, usize)>,
+    from: HashMap<u64, (f32, usize)>,
+) -> HashMap<u64, (f32, usize)> {
+    for (node_id, (sim, idx)) in from {
+        into.entry(node_id)
+            .and_modify(|existing| {
+                if sim > existing.0 {
+                    *existing = (sim, idx);
+                }
+            })
+            .or_insert((sim, idx));
+    }
+    into
+}
+
 impl ExactScanner {
     /// Exact parallel scan over memory-mapped / in-memory i8 vectors.
     /// Returns top-k hits grouped by node_id with max score and best unit range.
@@ -52,46 +68,44 @@ impl ExactScanner {
         let units = &store.units;
         let vectors = &store.vectors;
 
-        // 8-way parallel scan over units using Rayon
-        let scored_units: Vec<(usize, f32)> = (0..units.len())
+        // Parallel scan that keeps only the best unit per node in each
+        // worker's local map, instead of first materialising every unit
+        // above the floor (which for short queries is nearly all of them).
+        let node_best: HashMap<u64, (f32, usize)> = (0..units.len())
             .into_par_iter()
-            .filter_map(|idx| {
+            .fold(HashMap::new, |mut best: HashMap<u64, (f32, usize)>, idx| {
                 let unit = &units[idx];
                 if let Some(expected_id) = expected_model_id
                     && unit.model_id != expected_id
                 {
-                    return None;
+                    return best;
                 }
-
                 let node_id = unit.node_id;
                 if let Some(allowed) = allowed
                     && !allowed.contains(&node_id)
                 {
-                    return None;
+                    return best;
                 }
-
                 let start = idx * dim;
-                let end = start + dim;
-                let unit_vec = &vectors[start..end];
+                let unit_vec = &vectors[start..start + dim];
                 let sim = ModelRegistry::cosine_similarity_i8(query_vec, unit_vec);
-                Some((idx, sim))
+                if sim > 0.05 {
+                    best.entry(node_id)
+                        .and_modify(|existing| {
+                            if sim > existing.0 {
+                                *existing = (sim, idx);
+                            }
+                        })
+                        .or_insert((sim, idx));
+                }
+                best
             })
-            .filter(|&(_, sim)| sim > 0.05)
-            .collect();
-
-        // Group by node_id, keeping highest scoring unit per node
-        let mut node_best: HashMap<u64, (f32, usize)> = HashMap::new();
-        for (unit_idx, sim) in scored_units {
-            let node_id = units[unit_idx].node_id;
-            node_best
-                .entry(node_id)
-                .and_modify(|existing| {
-                    if sim > existing.0 {
-                        *existing = (sim, unit_idx);
-                    }
-                })
-                .or_insert((sim, unit_idx));
-        }
+            .reduce(HashMap::new, |a, b| {
+                if a.len() < b.len() {
+                    return merge_best(b, a);
+                }
+                merge_best(a, b)
+            });
 
         let mut hits: Vec<SemanticHit> = node_best
             .into_iter()

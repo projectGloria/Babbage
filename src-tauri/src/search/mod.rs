@@ -491,7 +491,7 @@ fn apply_sort(results: &mut [SearchResult], sort: SortOrder) {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SearchResponse {
     pub results: Vec<SearchResult>,
     pub seq: u64,
@@ -784,8 +784,46 @@ impl SearchDispatcher {
         )
     }
 
+    /// Every search entry point lands here; the work runs on the dedicated
+    /// query pool (`util::pools`) so CLI, MCP, daemon and GUI searches never
+    /// share rayon's global pool with a crawl.
     #[allow(clippy::too_many_arguments)]
     fn search_response_with_snippets(
+        raw_query: &str,
+        metadata: &MetadataStore,
+        content_index: &Option<ContentIndex>,
+        unit_store: Option<&UnitStore>,
+        visual_store: Option<&crate::embed::visual::VisualStore>,
+        semantic_enabled: bool,
+        limit: usize,
+        seq: u64,
+        with_snippets: bool,
+        sort: SortOrder,
+        aliases: &[(String, Vec<String>)],
+        offset: usize,
+        start_after: Option<&str>,
+    ) -> SearchResponse {
+        crate::util::pools::query_pool().install(|| {
+            Self::search_response_on_pool(
+                raw_query,
+                metadata,
+                content_index,
+                unit_store,
+                visual_store,
+                semantic_enabled,
+                limit,
+                seq,
+                with_snippets,
+                sort,
+                aliases,
+                offset,
+                start_after,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn search_response_on_pool(
         raw_query: &str,
         metadata: &MetadataStore,
         content_index: &Option<ContentIndex>,
@@ -1042,8 +1080,12 @@ impl SearchDispatcher {
         // corpus (the common unfiltered query).
         let candidate_set = CandidateSet::new(&candidate_indices, entries.len());
 
-        // The node-id map only serves the semantic/visual tiers. Building a
-        // million-entry map for a plain filename query is pure overhead.
+        // The node-id map only serves the semantic/visual tiers, and only for
+        // a narrowed candidate set. For the whole corpus (any unfiltered text
+        // query) it would cost two hash inserts per indexed file per
+        // keystroke; there the scan runs unrestricted and its few hits are
+        // mapped back through the store's id index instead.
+        let narrowed = candidate_indices.len() < entries.len();
         let wants_semantic = semantic_enabled
             && unit_store.is_some()
             && !search_text.is_empty()
@@ -1051,8 +1093,8 @@ impl SearchDispatcher {
             && ModelRegistry::global().is_enabled();
         let wants_visual = visual_store.is_some() && !search_text.is_empty() && !has_near;
         let (node_to_idx, allowed_node_ids): (HashMap<u64, usize>, Option<HashSet<u64>>) =
-            if wants_semantic || wants_visual {
-                let mut map = HashMap::new();
+            if narrowed && (wants_semantic || wants_visual) {
+                let mut map = HashMap::with_capacity(candidate_indices.len());
                 for &idx in &candidate_indices {
                     if let Some(entry) = entries.get(idx)
                         && entry.id > 0
@@ -1182,8 +1224,14 @@ impl SearchDispatcher {
                     Some(idx) => idx,
                     // Fallback for stores whose entries carry no node ids.
                     None if node_to_idx.is_empty() => metadata
-                        .get_by_node_id(hit.node_id)
-                        .and_then(|entry| resolve_index(&entry.path))
+                        .get_index_by_node_id(hit.node_id)
+                        .map(|idx| idx as usize)
+                        .filter(|&idx| entries.get(idx).is_some_and(|e| e.id == hit.node_id))
+                        .or_else(|| {
+                            metadata
+                                .get_by_node_id(hit.node_id)
+                                .and_then(|entry| resolve_index(&entry.path))
+                        })
                         .unwrap_or(usize::MAX),
                     None => continue,
                 };
@@ -1223,8 +1271,14 @@ impl SearchDispatcher {
                 let orig_idx = match node_to_idx.get(&node_id).copied() {
                     Some(idx) => idx,
                     None if node_to_idx.is_empty() => metadata
-                        .get_by_node_id(node_id)
-                        .and_then(|entry| resolve_index(&entry.path))
+                        .get_index_by_node_id(node_id)
+                        .map(|idx| idx as usize)
+                        .filter(|&idx| entries.get(idx).is_some_and(|e| e.id == node_id))
+                        .or_else(|| {
+                            metadata
+                                .get_by_node_id(node_id)
+                                .and_then(|entry| resolve_index(&entry.path))
+                        })
                         .unwrap_or(usize::MAX),
                     None => continue,
                 };
@@ -1257,27 +1311,14 @@ impl SearchDispatcher {
         }
 
         let mut candidates: HashMap<PathBuf, MatchCandidate> = HashMap::new();
+        // Filter-only / folder navigation browsing mode: every candidate is a
+        // plain filename match with the same fused score, so the per-path
+        // dedup map (one cloned `PathBuf` and hash insert per matched file)
+        // is skipped and rows are built straight from the indices.
+        let browse_mode =
+            fuzzy_text.is_empty() && bm25_groups.is_empty() && regex_patterns.is_empty();
 
-        if fuzzy_text.is_empty() && bm25_groups.is_empty() && regex_patterns.is_empty() {
-            // Filter-only / folder navigation browsing mode
-            for &idx in &candidate_indices {
-                if let Some(entry) = entries.get(idx) {
-                    candidates.insert(
-                        entry.path.clone(),
-                        MatchCandidate {
-                            entry_idx: idx,
-                            in_fuzzy: true,
-                            in_bm25: false,
-                            in_semantic: false,
-                            in_visual: false,
-                            in_folded: false,
-                            rrf_score: 0.1,
-                            best_range: None,
-                        },
-                    );
-                }
-            }
-        } else {
+        if !browse_mode {
             let (w_fuzzy, w_bm25, w_semantic, w_visual) = match route {
                 crate::query::router::QueryRoute::NameCode => (1.3, 0.8, 0.8, 0.5),
                 crate::query::router::QueryRoute::ContentPhrase => (0.8, 1.3, 1.0, 0.6),
@@ -1453,14 +1494,17 @@ impl SearchDispatcher {
         // 7. Apply ranking bonuses & build SearchResults
         // Normalize RRF before bonuses so an absolute depth term cannot
         // dominate the fused relevance signal.
-        let max_rrf = candidates
-            .values()
-            .map(|candidate| candidate.rrf_score)
-            .fold(0.0f64, f64::max);
+        const BROWSE_RRF: f64 = 0.1;
+        let max_rrf = if browse_mode {
+            BROWSE_RRF
+        } else {
+            candidates
+                .values()
+                .map(|candidate| candidate.rrf_score)
+                .fold(0.0f64, f64::max)
+        };
 
-        let mut results: Vec<SearchResult> = candidates
-            .into_iter()
-            .filter_map(|(path, cand)| {
+        let build_result = |path: &Path, cand: &MatchCandidate| -> Option<SearchResult> {
                 let entry = entries.get(cand.entry_idx)?;
 
                 // MatchType resolution: Semantic badge if only found by semantic tier,
@@ -1496,7 +1540,7 @@ impl SearchDispatcher {
                     cand.rrf_score,
                     max_rrf,
                     entry,
-                    &path,
+                    path,
                     &search_text_lower,
                     now_sec,
                     usage,
@@ -1515,8 +1559,34 @@ impl SearchDispatcher {
                     group_count: 1,
                     group_paths: Vec::new(),
                 })
-            })
-            .collect();
+        };
+
+        let mut results: Vec<SearchResult> = if browse_mode {
+            candidate_indices
+                .iter()
+                .filter_map(|&idx| {
+                    let entry = entries.get(idx)?;
+                    build_result(
+                        &entry.path,
+                        &MatchCandidate {
+                            entry_idx: idx,
+                            in_fuzzy: true,
+                            in_bm25: false,
+                            in_semantic: false,
+                            in_visual: false,
+                            in_folded: false,
+                            rrf_score: BROWSE_RRF,
+                            best_range: None,
+                        },
+                    )
+                })
+                .collect()
+        } else {
+            candidates
+                .iter()
+                .filter_map(|(path, cand)| build_result(path, cand))
+                .collect()
+        };
 
         // 8. Ordering: best-match by default; explicit sort when requested.
         apply_sort(&mut results, sort);

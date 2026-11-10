@@ -78,7 +78,7 @@ what the Windows portable zip uses.
 | `index/` | Tantivy content index, schema v4. Old schemas are kept as `index.legacy-*` and rebuilt once. |
 | `models/` | Static embedding table and the optional smart model. |
 | `ocr/`, `ocr-indra/`, `tessdata/` | Downloaded OCR packs and Tesseract language data. |
-| `thumbs/` | 320 px JPEG thumbnails used by the grid and dHash. |
+| `thumbs/` | 240 px JPEG thumbnails used by the grid and dHash. |
 | `babbage.log`, `crash.log` | Startup milestones and failure-only crash log. |
 | `daemon.token`, `babbage.lock`, `babbage-gui.lock` | IPC/auth and single-instance state. |
 
@@ -92,11 +92,16 @@ path instead of materializing a `PathBuf` per entry:
 
 - a 64-byte `Node` per file/directory;
 - concatenated folded names plus a path index;
-- a 64-bit character bloom per name used as a cheap prefilter;
-- a small delta buffer for watcher mutations, merged at idle.
+- a 64-bit character bloom per name used as a cheap prefilter.
 
-Identity is `(device, inode)` / Windows `file_id`, never the path, so a rename
-updates one row and never re-extracts content. Unavailable roots (unplugged
+Watcher mutations are applied to the arena in place; there is no separate
+delta buffer. The name bytes are append-only (an unchanged name is reused,
+a renamed one is appended) and are compacted only when the store is rebuilt.
+
+Identity is `(device, inode)` / Windows `file_id`, never the path, so a file
+rename updates one row and never re-extracts content. A *directory* rename is
+different today: the watcher drops the old subtree's documents, re-walks the
+new location and re-reads indexable files (and re-hashes images) under it. Unavailable roots (unplugged
 drives, unmounted shares) are preserved rather than pruned.
 
 `FileEntry` is the materialized query-time view. Its exact size is printed by
@@ -278,7 +283,7 @@ commands, which forward to the daemon or the in-process indexer.
 - **Search surface** stays quiet: search field, category chips, results,
   preview, and a thin indexing line. Sorting, filters, and saved searches are
   in the result controls.
-- **Grid or list** (`results_view`, default `grid`), 320 px thumbnails, hover
+- **Grid or list** (`results_view`, default `grid`), 240 px thumbnails, hover
   details, right-click actions, full keyboard navigation, and `Cmd/Ctrl+Shift+L`
   to toggle the layout.
 - **Setup** is a guided flow: folders, exclusions, preferences, optional packs,

@@ -879,44 +879,22 @@ fn handle_path_remove(
         .map(|entry| entry.is_dir)
         .unwrap_or(false);
 
-    metadata.write().remove(path);
-    if let Some(c_index) = content_index.read().as_ref() {
-        let _ = c_index.remove(path);
-    }
-
     if !was_dir {
-        return;
-    }
-
-    let descendants: Vec<PathBuf> = {
-        let store = metadata.read();
-        (0..store.len())
-            .filter_map(|i| {
-                let e = store.materialize(i as u32);
-                if e.path != path && e.path.starts_with(path) {
-                    Some(e.path)
-                } else {
-                    None
-                }
-            })
-            .collect()
-    };
-
-    if descendants.is_empty() {
-        return;
-    }
-
-    {
-        let mut store = metadata.write();
-        for descendant in &descendants {
-            store.remove(descendant);
+        metadata.write().remove(path);
+        if let Some(c_index) = content_index.read().as_ref() {
+            let _ = c_index.remove(path);
         }
+        return;
     }
 
+    // Find descendants before removing the directory itself: the lookup walks
+    // parent links from the directory's slot instead of materialising every
+    // entry, and the removal is one compaction instead of one per file.
+    let mut doomed = metadata.read().descendant_paths(path);
+    doomed.push(path.to_path_buf());
+    metadata.write().remove_many(&doomed);
     if let Some(c_index) = content_index.read().as_ref() {
-        for descendant in &descendants {
-            let _ = c_index.remove(descendant);
-        }
+        let _ = c_index.remove_many(&doomed);
     }
 }
 

@@ -30,6 +30,12 @@ pub struct MetadataStore {
     /// headless agent index, a test fixture), and a global cache would hand one
     /// store's rows to another.
     cached_entries: RwLock<Option<(u64, Arc<Vec<crate::indexer::walker::FileEntry>>)>>,
+    /// Slots changed in place since the snapshot was built (flag flips, an
+    /// existing file's size/mtime). These patch the cached snapshot instead
+    /// of bumping `generation`, which would force a full re-materialisation
+    /// of every entry on the next query: ~30 ms at 100k files, ~300 ms at 1M,
+    /// repeatedly during a crawl.
+    dirty_slots: parking_lot::Mutex<Vec<u32>>,
 }
 
 impl Default for MetadataStore {
@@ -51,6 +57,7 @@ impl MetadataStore {
             usage: RwLock::new(HashMap::new()),
             cached_trie: RwLock::new(None),
             cached_entries: RwLock::new(None),
+            dirty_slots: parking_lot::Mutex::new(Vec::new()),
         }
     }
 
@@ -224,7 +231,16 @@ impl MetadataStore {
             } else {
                 entry.name.clone()
             };
-            let (name_off, name_len) = self.arena.names.push(&node_name);
+            // Reuse the stored name when unchanged: the name arena is
+            // append-only, so re-pushing on every update leaked its bytes.
+            let (name_off, name_len) = {
+                let old = self.arena.node(idx);
+                if self.arena.name(idx) == node_name {
+                    (old.name_off, old.name_len)
+                } else {
+                    self.arena.names.push(&node_name)
+                }
+            };
             let mut flags = 0u8;
             if entry.is_dir {
                 flags |= Node::FLAG_DIR;
@@ -285,7 +301,11 @@ impl MetadataStore {
             idx
         };
 
-        self.generation.fetch_add(1, Ordering::SeqCst);
+        if existing.is_some() && !is_dir {
+            self.mark_slot_dirty(idx);
+        } else {
+            self.generation.fetch_add(1, Ordering::SeqCst);
+        }
 
         if is_dir {
             self.dir_generation.fetch_add(1, Ordering::SeqCst);
@@ -467,7 +487,7 @@ impl MetadataStore {
             let node = self.arena.node(idx);
             if !node.content_pending() {
                 self.arena.node_mut(idx).set_content_pending(true);
-                self.generation.fetch_add(1, Ordering::SeqCst);
+                self.mark_slot_dirty(idx);
             }
         }
 
@@ -487,7 +507,7 @@ impl MetadataStore {
             let node = self.arena.node(idx);
             if node.content_pending() {
                 self.arena.node_mut(idx).set_content_pending(false);
-                self.generation.fetch_add(1, Ordering::SeqCst);
+                self.mark_slot_dirty(idx);
             }
         }
 
@@ -497,6 +517,129 @@ impl MetadataStore {
             eprintln!(
                 "[Babbage] Failed to clear pending content for '{}': {}",
                 path.display(),
+                e
+            );
+        }
+    }
+
+    /// Every indexed path strictly below `dir`, found by following parent
+    /// links: no path is materialised for nodes outside the subtree.
+    pub fn descendant_paths(&self, dir: &Path) -> Vec<PathBuf> {
+        let Some(root) = self.find_path_index(dir) else {
+            return Vec::new();
+        };
+        let n = self.arena.len();
+        // 0 = unknown, 1 = inside, 2 = outside; memoised per slot so each
+        // parent chain is walked once.
+        let mut state = vec![0u8; n];
+        state[root as usize] = 1;
+        let mut chain: Vec<u32> = Vec::new();
+        for start in 0..n as u32 {
+            let mut cur = start;
+            chain.clear();
+            let verdict = loop {
+                let s = state[cur as usize];
+                if s != 0 {
+                    break s;
+                }
+                chain.push(cur);
+                let parent = self.arena.node(cur).parent;
+                if parent == crate::indexer::arena::NO_PARENT || parent as usize >= n {
+                    break 2;
+                }
+                cur = parent;
+            };
+            for &c in &chain {
+                state[c as usize] = verdict;
+            }
+        }
+        (0..n as u32)
+            .filter(|&i| i != root && state[i as usize] == 1)
+            .map(|i| self.arena.path(i))
+            .collect()
+    }
+
+    /// Removes many paths in one O(N) compaction instead of one swap-remove
+    /// (with its index fix-ups and SQL round trip) per path.
+    pub fn remove_many(&mut self, paths: &[PathBuf]) {
+        if paths.len() < 16 {
+            // Deepest first: `remove` swap-removes, and removing a directory
+            // before its children would leave them pointing at whichever
+            // node is swapped into the directory's slot.
+            let mut ordered: Vec<&PathBuf> = paths.iter().collect();
+            ordered.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+            for path in ordered {
+                self.remove(path);
+            }
+            return;
+        }
+        let n = self.arena.len();
+        let mut removed = vec![false; n];
+        let mut count = 0usize;
+        let mut any_dir = false;
+        for path in paths {
+            if let Some(idx) = self.find_path_index(path)
+                && !removed[idx as usize]
+            {
+                removed[idx as usize] = true;
+                count += 1;
+                any_dir |= self.arena.node(idx).is_dir();
+            }
+        }
+        if count > 0 {
+            let mut remap = vec![u32::MAX; n];
+            let mut next = 0u32;
+            for (i, gone) in removed.iter().enumerate() {
+                if !gone {
+                    remap[i] = next;
+                    next += 1;
+                }
+            }
+            let mut bursts = self.bursts.write();
+            let old_bursts = bursts.take();
+            let mut new_bursts = old_bursts
+                .as_ref()
+                .map(|_| Vec::with_capacity(next as usize));
+            let mut nodes = Vec::with_capacity(next as usize);
+            for (i, gone) in removed.iter().enumerate() {
+                if *gone {
+                    continue;
+                }
+                let mut node = self.arena.nodes[i];
+                if node.parent != crate::indexer::arena::NO_PARENT {
+                    node.parent = remap
+                        .get(node.parent as usize)
+                        .copied()
+                        .unwrap_or(crate::indexer::arena::NO_PARENT);
+                }
+                nodes.push(node);
+                if let (Some(nb), Some(ob)) = (new_bursts.as_mut(), old_bursts.as_ref()) {
+                    nb.push(ob.get(i).copied().unwrap_or(0));
+                }
+            }
+            *bursts = new_bursts;
+            drop(bursts);
+            self.arena.nodes = nodes;
+            self.path_index.clear();
+            for i in 0..self.arena.len() {
+                let idx = i as u32;
+                let p = self.arena.path(idx);
+                self.insert_path_index(&p, idx);
+            }
+            *self.id_index.write() = None;
+            self.dirty_slots.lock().clear();
+            self.generation.fetch_add(1, Ordering::SeqCst);
+            if any_dir {
+                self.dir_generation.fetch_add(1, Ordering::SeqCst);
+                *self.cached_trie.write() = None;
+            }
+        }
+        if let Some(db) = self.db.as_ref()
+            && let Err(e) = db.remove_many(paths)
+        {
+            eprintln!(
+                "[Babbage] Failed to delete {} metadata entries: {}",
+                paths.len(),
                 e
             );
         }
@@ -544,7 +687,10 @@ impl MetadataStore {
                     bursts[idx as usize] = bursts[last_idx as usize];
                 }
             }
-            if idx < last_idx {
+            // Only directories have children. Files are the vast majority of
+            // nodes, and scanning the whole arena per removed file made
+            // folder deletes quadratic under the write lock.
+            if idx < last_idx && self.arena.nodes[idx as usize].is_dir() {
                 for node in self.arena.nodes.iter_mut() {
                     if node.parent == last_idx {
                         node.parent = idx;
@@ -728,8 +874,38 @@ impl MetadataStore {
     /// while another thread mutates the store: the worst case is one query
     /// seeing a list one generation old, which is what it read before the cache
     /// existed.
+    fn mark_slot_dirty(&self, idx: u32) {
+        let mut dirty = self.dirty_slots.lock();
+        dirty.push(idx);
+        // Past this many patches a rebuild is as cheap; stop tracking.
+        if dirty.len() > self.arena.len() / 8 + 64 {
+            dirty.clear();
+            self.generation.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
     pub fn entries_snapshot(&self) -> Arc<Vec<crate::indexer::walker::FileEntry>> {
         let current_gen = self.generation.load(Ordering::SeqCst);
+        {
+            let mut dirty = self.dirty_slots.lock();
+            if !dirty.is_empty() {
+                let mut cache = self.cached_entries.write();
+                match cache.as_mut() {
+                    Some((cached_gen, entries)) if *cached_gen == current_gen => {
+                        // Unique unless a query still holds the old list;
+                        // then this clones once, still cheaper than a rebuild.
+                        let rows = Arc::make_mut(entries);
+                        for &idx in dirty.iter() {
+                            if let Some(row) = rows.get_mut(idx as usize) {
+                                *row = self.materialize(idx);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                dirty.clear();
+            }
+        }
         // `parking_lot` locks are not poisoned, so there is no Result to unwrap
         // here: the same shape as `cached_trie` above.
         {
@@ -828,6 +1004,11 @@ impl MetadataStore {
     }
 
     pub fn get_index_by_node_id(&self, node_id: u64) -> Option<u32> {
+        // Fast path: shared lock once the index exists (the common case), so
+        // concurrent lookups from ranking never serialize on a write lock.
+        if let Some(index) = self.id_index.read().as_ref() {
+            return index.get(node_id);
+        }
         let mut guard = self.id_index.write();
         if guard.is_none() {
             let mut index = IdIndex::new();
@@ -1016,6 +1197,106 @@ mod tests {
             char_bloom: 0,
             content_pending: false,
         }
+    }
+
+    fn tree(store: &mut MetadataStore, root: &Path, dirs: usize, files: usize) -> Vec<PathBuf> {
+        store.add(entry(root, true));
+        let mut all = Vec::new();
+        for d in 0..dirs {
+            let dir = root.join(format!("d{d}"));
+            store.add(entry(&dir, true));
+            for f in 0..files {
+                let file = dir.join(format!("f{f}.txt"));
+                store.add(entry(&file, false));
+                all.push(file);
+            }
+            all.push(dir);
+        }
+        all
+    }
+
+    #[test]
+    fn remove_many_matches_one_by_one_removal() {
+        let mut a = TempStore::new("remove-many-a");
+        let mut b = TempStore::new("remove-many-b");
+        let root_a = a.dir.join("root");
+        let root_b = b.dir.join("root");
+        tree(a.store(), &root_a, 6, 10);
+        tree(b.store(), &root_b, 6, 10);
+
+        // Directories listed before their children, as a caller might.
+        let doomed = |root: &Path, big: bool| -> Vec<PathBuf> {
+            let mut paths = vec![root.join("d2")];
+            paths.extend((0..10).map(|f| root.join("d2").join(format!("f{f}.txt"))));
+            paths.extend((0..10).step_by(3).map(|f| root.join("d4").join(format!("f{f}.txt"))));
+            if big {
+                paths.push(root.join("d3"));
+                paths.extend((0..10).map(|f| root.join("d3").join(format!("f{f}.txt"))));
+            }
+            paths
+        };
+        // Small batch (fallback path), then a large one (compaction path).
+        a.store().remove_many(&doomed(&root_a, false));
+        a.store().remove_many(&doomed(&root_a, true));
+        // Reference: one at a time, children before their directory.
+        let mut reference = doomed(&root_b, true);
+        reference.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+        for path in reference {
+            b.store().remove(&path);
+        }
+
+        let names = |store: &MetadataStore, root: &Path| -> Vec<String> {
+            let mut v: Vec<String> = store
+                .entries_snapshot()
+                .iter()
+                .map(|e| e.path.strip_prefix(root).unwrap().to_string_lossy().into_owned())
+                .collect();
+            v.sort();
+            v
+        };
+        let (sa, sb) = (a.store.as_ref().unwrap(), b.store.as_ref().unwrap());
+        assert_eq!(names(sa, &root_a), names(sb, &root_b));
+        // Every surviving path still resolves to itself.
+        for e in sa.entries_snapshot().iter() {
+            let idx = sa.get_index(&e.path).unwrap_or_else(|| panic!("not indexed: {:?} (len {})", e.path, sa.len()));
+            assert_eq!(sa.materialize(idx).path, e.path);
+        }
+        assert!(sa.get(&root_a.join("d2").join("f0.txt")).is_none());
+    }
+
+    #[test]
+    fn descendant_paths_lists_only_the_subtree() {
+        let mut temp = TempStore::new("descendants");
+        let root = temp.dir.join("root");
+        tree(temp.store(), &root, 3, 4);
+        let mut got = temp.store().descendant_paths(&root.join("d1"));
+        got.sort();
+        let mut want: Vec<PathBuf> = (0..4).map(|f| root.join("d1").join(format!("f{f}.txt"))).collect();
+        want.sort();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn in_place_updates_patch_the_snapshot_without_a_rebuild() {
+        let mut temp = TempStore::new("snapshot-patch");
+        let root = temp.dir.join("root");
+        tree(temp.store(), &root, 2, 3);
+        let file = root.join("d0").join("f1.txt");
+        let store = temp.store();
+        let before = store.entries_snapshot();
+        let generation = store.generation();
+        drop(before);
+
+        store.set_content_pending(&file);
+        let mut changed = entry(&file, false);
+        changed.size = 99;
+        store.add(changed);
+
+        assert_eq!(store.generation(), generation, "in-place edits must not bump generation");
+        let snapshot = store.entries_snapshot();
+        let row = snapshot.iter().find(|e| e.path == file).expect("row");
+        assert_eq!(row.size, 99);
+        assert!(row.content_pending);
     }
 
     #[test]

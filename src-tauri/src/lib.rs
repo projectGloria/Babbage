@@ -548,7 +548,7 @@ pub fn run() {
             {
                 let handle = app.handle().clone();
                 std::thread::spawn(move || loop {
-                    std::thread::sleep(std::time::Duration::from_millis(150));
+                    std::thread::sleep(std::time::Duration::from_millis(300));
                     let path = window_request_path();
                     let Ok(request) = std::fs::read_to_string(&path) else {
                         continue;
@@ -621,24 +621,41 @@ pub fn run() {
                     _ => {}
                 });
 
-            // On Windows, pick the initial tray icon that matches the app theme so
-            // the icon is visible on both light and dark taskbars.  Other platforms
-            // keep the default window icon (Tauri picks the best size automatically).
-            #[cfg(windows)]
+            // Idle shows the full-colour app icon; the watcher below swaps
+            // in the monochrome glyph while indexing, embedding or searching.
+            if let Some(icon) = tray_icon::decode_png(tray_icon::icon_bytes(&config.theme, false))
+                .or_else(|| app.default_window_icon().cloned())
             {
-                let icon_bytes = tray_icon::tray_icon_bytes(&config.theme);
-                if let Some(icon) =
-                    tray_icon::decode_png(icon_bytes).or_else(|| app.default_window_icon().cloned())
-                {
-                    tray_builder = tray_builder.icon(icon);
-                }
-            }
-            #[cfg(not(windows))]
-            if let Some(icon) = app.default_window_icon() {
-                tray_builder = tray_builder.icon(icon.clone());
+                tray_builder = tray_builder.icon(icon);
             }
 
             let _ = tray_builder.build(app);
+
+            // Keep the tray icon in step with work: dimmed while busy, full
+            // colour when idle. Only touches the tray when the state changes.
+            {
+                let handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    let mut shown_busy = false;
+                    let mut shown_theme = String::new();
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                        let state = handle.state::<AppState>();
+                        let busy = {
+                            let st = state.indexer.status.read();
+                            st.is_indexing || st.is_embedding
+                        } || tray_icon::searching();
+                        // Compare in place: no `String` clone per tick.
+                        let theme_changed = state.indexer.config.read().theme != shown_theme;
+                        if busy != shown_busy || theme_changed {
+                            let theme = state.indexer.config.read().theme.clone();
+                            tray_icon::apply(&handle, &theme, busy);
+                            shown_busy = busy;
+                            shown_theme = theme;
+                        }
+                    }
+                });
+            }
 
             // 3. Launcher mode starts in the background (tray, watcher and
             // indexer only); the window is created by the first toggle

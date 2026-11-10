@@ -7,7 +7,30 @@
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Mutex, OnceLock};
+
+/// Compiles a pattern once per process. This pass runs on every keystroke
+/// and holds ~30 case-insensitive rules; compiling them inline was a fixed
+/// ~5 ms floor under every search. `Regex` clones share the compiled program.
+fn cached_regex(pattern: &str) -> Result<Regex, regex::Error> {
+    // Alias patterns are user-defined; cap the cache so a churning alias list
+    // cannot grow it without bound.
+    const MAX_CACHED: usize = 1024;
+    static CACHE: OnceLock<Mutex<HashMap<String, Regex>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(re) = cache.lock().ok().and_then(|c| c.get(pattern).cloned()) {
+        return Ok(re);
+    }
+    let re = Regex::new(pattern)?;
+    if let Ok(mut c) = cache.lock() {
+        if c.len() >= MAX_CACHED {
+            c.clear();
+        }
+        c.insert(pattern.to_string(), re.clone());
+    }
+    Ok(re)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InterpretationChip {
@@ -78,7 +101,7 @@ pub fn compile_with_aliases(raw: &str, aliases: &[(String, Vec<String>)]) -> Int
             (r"(?i)\b(?:biggest|largest)\b", "largest", "Largest"),
         ] {
             if sort.is_none()
-                && let Ok(re) = Regex::new(pat)
+                && let Ok(re) = cached_regex(pat)
                 && re.is_match(&work)
             {
                 let source = re
@@ -120,7 +143,7 @@ pub fn compile_with_aliases(raw: &str, aliases: &[(String, Vec<String>)]) -> Int
                 "Modified: last year",
             ),
         ] {
-            if let Ok(re) = Regex::new(pat) {
+            if let Ok(re) = cached_regex(pat) {
                 take(
                     &mut work,
                     &re,
@@ -148,7 +171,7 @@ pub fn compile_with_aliases(raw: &str, aliases: &[(String, Vec<String>)]) -> Int
                 "Modified: days ago",
             ),
         ] {
-            if let Ok(re) = Regex::new(pat)
+            if let Ok(re) = cached_regex(pat)
                 && let Some(m) = re.captures(&work)
             {
                 let whole = m.get(0).map(|x| x.as_str().to_string()).unwrap_or_default();
@@ -171,7 +194,7 @@ pub fn compile_with_aliases(raw: &str, aliases: &[(String, Vec<String>)]) -> Int
 
         // --- Size -------------------------------------------------------
         if let Ok(re) =
-            Regex::new(r"(?i)\b(?:under|less than|smaller than)\s+(\d+(?:\.\d+)?)\s*(kb|mb|gb)\b")
+            cached_regex(r"(?i)\b(?:under|less than|smaller than)\s+(\d+(?:\.\d+)?)\s*(kb|mb|gb)\b")
             && let Some(c) = re.captures(&work)
         {
             let number = c[1].to_string();
@@ -187,7 +210,7 @@ pub fn compile_with_aliases(raw: &str, aliases: &[(String, Vec<String>)]) -> Int
                 source,
             });
         }
-        if let Ok(re) = Regex::new(
+        if let Ok(re) = cached_regex(
             r"(?i)\b(?:over|more than|larger than|bigger than)\s+(\d+(?:\.\d+)?)\s*(kb|mb|gb)\b",
         ) && let Some(c) = re.captures(&work)
         {
@@ -212,7 +235,7 @@ pub fn compile_with_aliases(raw: &str, aliases: &[(String, Vec<String>)]) -> Int
             ),
             (r"(?i)\b(?:tiny|small)\b", "size:<1mb", "Size: under 1 MB"),
         ] {
-            if let Ok(re) = Regex::new(pat) {
+            if let Ok(re) = cached_regex(pat) {
                 take(
                     &mut work,
                     &re,
@@ -227,7 +250,7 @@ pub fn compile_with_aliases(raw: &str, aliases: &[(String, Vec<String>)]) -> Int
 
         // --- Visual search intent --------------------------------------
         for pat in [r"(?i)\b(?:visual search|search visually for|visually)\b"] {
-            if let Ok(re) = Regex::new(pat)
+            if let Ok(re) = cached_regex(pat)
                 && re.is_match(&work)
             {
                 let source = re
@@ -292,7 +315,7 @@ pub fn compile_with_aliases(raw: &str, aliases: &[(String, Vec<String>)]) -> Int
             ),
             (r"(?i)\blogs?\b", "ext:log", "Type: logs"),
         ] {
-            if let Ok(re) = Regex::new(pat) {
+            if let Ok(re) = cached_regex(pat) {
                 take(
                     &mut work,
                     &re,
@@ -306,7 +329,7 @@ pub fn compile_with_aliases(raw: &str, aliases: &[(String, Vec<String>)]) -> Int
         }
 
         // --- Place ------------------------------------------------------
-        if let Ok(re) = Regex::new(
+        if let Ok(re) = cached_regex(
             r"(?i)\bin\s+(?:my\s+)?(projects|downloads|documents|desktop|pictures|videos|music|work)\b",
         ) {
             // --- Personal vocabulary ----------------------------------
@@ -315,7 +338,7 @@ pub fn compile_with_aliases(raw: &str, aliases: &[(String, Vec<String>)]) -> Int
                 if term.is_empty() {
                     continue;
                 }
-                let Ok(re) = Regex::new(&format!(r"(?i)\b{}\b", regex::escape(term))) else {
+                let Ok(re) = cached_regex(&format!(r"(?i)\b{}\b", regex::escape(term))) else {
                     continue;
                 };
                 if !re.is_match(&work) {
@@ -368,7 +391,7 @@ pub fn compile_with_aliases(raw: &str, aliases: &[(String, Vec<String>)]) -> Int
     }
 
     // Drop connective filler left behind once the intent words are removed.
-    if let Ok(re) = Regex::new(r"(?i)\b(?:from|the|a|an|my|me|show|find|get|give|all|some|of)\b") {
+    if let Ok(re) = cached_regex(r"(?i)\b(?:from|the|a|an|my|me|show|find|get|give|all|some|of)\b") {
         work = re.replace_all(&work, " ").to_string();
     }
 

@@ -59,7 +59,7 @@ index, OCR state, everything else under the data directory):
 | `show_thumbnails` | bool | `true` | Generate and show result thumbnails. |
 | `results_view` | string | `grid` | `grid` or `list`. |
 | `auto_update` | bool | `true` | Check GitHub for updates in the background (about every 12 hours). |
-| `app_mode` | string | `launcher` | `launcher` (tray, shortcut, hides on blur) or `app` (normal taskbar window). |
+| `app_mode` | string | `launcher` | `launcher` (tray, shortcut, hides on Esc) or `app` (normal taskbar window). |
 | `close_to_background` | bool | `true` | Closing the window keeps Babbage running in the tray. |
 | `config_version` | number | internal | Schema version used for one-time migrations. Do not edit. |
 

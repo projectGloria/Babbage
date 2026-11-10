@@ -111,14 +111,22 @@ NTFS, release build, 25.4 GB free. Antivirus real-time scanning was left on.
 
 **Why Windows is slower here.** Two effects, both real:
 
-1. **The walk is NTFS + antivirus bound.** 100k tiny files cost ~10 s on this
-   machine, versus ~190 ms on the warm Linux reference. The walk is not the
-   per-keystroke path; it is the first scan.
+1. **The walk was bound by a per-file metadata call, not by NTFS.** jwalk's
+   `DirEntry::metadata()` opens and queries every file, which on Windows (with
+   antivirus filters) measured 37-73 us per entry against 2.5 us for the data
+   the directory listing already returns. The walker now reuses the listing's
+   metadata (`walker.rs`, `listing_metadata`). Separately, the post-walk
+   `.gitignore` filter tested every rule directory against every path; on a
+   123k-entry tree with many ignore files that was 34 s of a 35 s walk. It
+   now looks up only the path's ancestors: the same tree walks in ~3.4 s.
 2. **Rayon oversubscription hurts a cheap prefiltered scan.** The char-bloom
    prefilter rejects most entries without scoring them, so the work per entry is
    tiny. At 16 threads the scheduling and collection overhead dominates; 4–8
-   threads are faster on this corpus. This is a known scheduling cost, not a
-   correctness issue. `RAYON_NUM_THREADS=4` reproduces the faster number.
+   threads are faster on this corpus. The app therefore no longer runs query
+   stages on the default pool: search uses a dedicated 4-thread pool
+   (`util/pools.rs`), and the crawl has its own pool so the two never queue
+   behind each other. The harness above still uses the default pool;
+   `RAYON_NUM_THREADS=4` reproduces what the app now does.
 
 Treat the Windows fuzzy numbers as the honest current measurement, not a
 guarantee. The same build on the Linux reference machine is in the low

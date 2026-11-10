@@ -368,6 +368,16 @@ impl Drop for ExtractionSlot {
     }
 }
 
+/// Extra pool threads beyond the slot count. A Rust thread cannot be
+/// cancelled, so an extraction that blows its timeout keeps running; its slot
+/// is handed back (up to this many at once) and the spare thread absorbs it,
+/// so a few hung documents no longer stall every other file for 30 s each.
+const SPARE_EXTRACTION_THREADS: usize = 4;
+
+/// Timed-out tasks whose slot was released but which are still running.
+static ABANDONED_EXTRACTIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 static SLOT_POOL: std::sync::OnceLock<SlotPool> = std::sync::OnceLock::new();
 
 fn slot_pool() -> &'static SlotPool {
@@ -385,7 +395,7 @@ fn extraction_pool() -> Option<&'static rayon::ThreadPool> {
             // pinning much memory. Capped at 8 to keep the number of concurrent
             // OCR processes (and their RSS) bounded on a desktop.
             match rayon::ThreadPoolBuilder::new()
-                .num_threads(extraction_concurrency())
+                .num_threads(extraction_concurrency() + SPARE_EXTRACTION_THREADS)
                 .thread_name(|index| format!("babbage-extract-{}", index))
                 .build()
             {
@@ -530,10 +540,23 @@ fn extract_document_tracked(
             let worker_path = path.to_path_buf();
             let worker_external = external.clone();
             let worker_retry = std::sync::Arc::clone(retry);
+            // Shared so the caller can release the slot on timeout.
+            let slot = std::sync::Arc::new(Mutex::new(Some(slot)));
+            let worker_slot = std::sync::Arc::clone(&slot);
             pool.spawn(move || {
-                // Keep the slot alive for the real duration of the work, even
-                // if the caller stopped waiting.
-                let _slot = slot;
+                // Holds the slot for the real duration of the work unless the
+                // caller released it on timeout (then this task is counted as
+                // abandoned and uncounts itself when it finally ends).
+                struct Release(std::sync::Arc<Mutex<Option<ExtractionSlot>>>);
+                impl Drop for Release {
+                    fn drop(&mut self) {
+                        let held = self.0.lock().map(|mut s| s.take()).unwrap_or(None);
+                        if held.is_none() {
+                            ABANDONED_EXTRACTIONS.fetch_sub(1, Ordering::SeqCst);
+                        }
+                    }
+                }
+                let _slot = Release(worker_slot);
                 // Catch panics here: a panic escaping a `rayon::spawn` task
                 // reaches rayon's panic handler (which aborts by default), and
                 // a malformed document must never take the app down.
@@ -561,6 +584,18 @@ fn extract_document_tracked(
             match rx.recv_timeout(timeout) {
                 Ok(result) => result,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    // Hand the slot back if a spare thread can absorb the
+                    // still-running task.
+                    if ABANDONED_EXTRACTIONS.fetch_add(1, Ordering::SeqCst) < SPARE_EXTRACTION_THREADS {
+                        let released = slot.lock().map(|mut s| s.take()).unwrap_or(None);
+                        if released.is_none() {
+                            // The task finished in the meantime.
+                            ABANDONED_EXTRACTIONS.fetch_sub(1, Ordering::SeqCst);
+                        }
+                        drop(released);
+                    } else {
+                        ABANDONED_EXTRACTIONS.fetch_sub(1, Ordering::SeqCst);
+                    }
                     warn_extraction_timeout(path, timeout);
                     retry.store(true, Ordering::SeqCst);
                     None

@@ -18,6 +18,8 @@ interface SearchBarProps {
   searching?: boolean;
   /** Icon buttons rendered at the right end of the capsule (settings). */
   trailing?: React.ReactNode;
+  /** Window buttons for the frameless window, shown in the drag strip's top-left. */
+  windowControls?: React.ReactNode;
 }
 
 export function SearchBar({
@@ -29,6 +31,7 @@ export function SearchBar({
   total,
   searching,
   trailing,
+  windowControls,
 }: SearchBarProps) {
   const [phIdx, setPhIdx] = useState(0);
   const rotateRef = useRef(false);
@@ -58,7 +61,10 @@ export function SearchBar({
   const Glyph = isCommandMode ? Terminal : Search;
 
   return (
-    <div data-tauri-drag-region className="px-3.5 pb-1.5 pt-2.5">
+    <div data-tauri-drag-region className="px-3.5 pb-2.5 pt-1.5">
+      <div data-tauri-drag-region className="flex h-8 items-center px-1">
+        {windowControls}
+      </div>
       <div className="relative flex h-11 items-center gap-2.5 pl-3.5 pr-1.5">
         <Glyph className="h-5 w-5 shrink-0 text-muted" strokeWidth={1.75} />
         <input

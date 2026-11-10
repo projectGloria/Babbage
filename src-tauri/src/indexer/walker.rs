@@ -213,6 +213,34 @@ pub fn starts_with_any(path: &std::path::Path, prune_roots: &[PathBuf]) -> bool 
     prune_roots.iter().any(|root| path.starts_with(root))
 }
 
+/// Per-entry state carried through jwalk: the metadata the directory listing
+/// already returned. On Windows `FindNextFileW` reports size, timestamps and
+/// attributes with each name, and `std::fs::DirEntry::metadata` hands those
+/// back without touching the file. jwalk's own `DirEntry::metadata` opens and
+/// queries every file instead, which measured ~15x slower and ~98% of walk
+/// time (37-73 us versus 2.5 us per entry, Defender on).
+#[derive(Debug, Default)]
+struct WalkState;
+
+impl jwalk::ClientState for WalkState {
+    type ReadDirState = ();
+    type DirEntryState = Option<std::fs::Metadata>;
+}
+
+/// Metadata for every child of `dir`, from the listing itself.
+#[cfg(windows)]
+fn listing_metadata(dir: &std::path::Path) -> std::collections::HashMap<std::ffi::OsString, std::fs::Metadata> {
+    let mut map = std::collections::HashMap::new();
+    if let Ok(read) = std::fs::read_dir(dir) {
+        for entry in read.flatten() {
+            if let Ok(meta) = entry.metadata() {
+                map.insert(entry.file_name(), meta);
+            }
+        }
+    }
+    map
+}
+
 /// Walks `dirs` and returns file entries.
 ///
 /// When `include_ignored` is false (the default), `.gitignore` /
@@ -226,7 +254,10 @@ pub fn walk_directories(
     include_ignored: bool,
 ) -> Vec<FileEntry> {
     let mut result = Vec::new();
-    let mut ignore_dirs: Vec<PathBuf> = Vec::new();
+    // Directories that hold an ignore file, noted while their listing is in
+    // hand. Probing every visited directory on disk for three file names
+    // afterwards was most of the crawl's walk time on large trees.
+    let ignore_dirs: std::sync::Arc<std::sync::Mutex<Vec<PathBuf>>> = Default::default();
     let excluded_set: HashSet<String> = excluded_dirs.iter().map(|s| s.to_lowercase()).collect();
 
     // Default-deny sensitive paths. These are skipped even if the user has not
@@ -258,13 +289,27 @@ pub fn walk_directories(
         }
 
         // TODO: make hidden-file skipping configurable via `BabbageConfig::skip_hidden`.
-        let walker = jwalk::WalkDir::new(root)
-            .skip_hidden(true)
+        let walker = jwalk::WalkDirGeneric::<WalkState>::new(root)
+            // Hidden entries are dropped in `process_read_dir` below instead,
+            // after it has noted any `.gitignore`-style files among them.
+            .skip_hidden(false)
             .process_read_dir({
+                let ignore_dirs = std::sync::Arc::clone(&ignore_dirs);
                 let excluded_set = excluded_set.clone();
                 let sensitive_set = sensitive_set.clone();
                 let prune_roots = prunes_for_roots(dirs);
-                move |_depth, _path, _read_dir_state, children| {
+                move |_depth, dir_path, _read_dir_state, children| {
+                    if !include_ignored
+                        && children.iter().flatten().any(|entry| {
+                            let name = entry.file_name.to_string_lossy();
+                            crate::indexer::ignore::IGNORE_FILE_NAMES
+                                .iter()
+                                .any(|candidate| name.eq_ignore_ascii_case(candidate))
+                        })
+                        && let Ok(mut dirs) = ignore_dirs.lock()
+                    {
+                        dirs.push(dir_path.to_path_buf());
+                    }
                     children.retain(|dir_entry_result| {
                         if let Ok(entry) = dir_entry_result {
                             // Babbage's own runtime data: never crawl it
@@ -292,7 +337,22 @@ pub fn walk_directories(
                     // phone over Phone Link, an "offline" popup). Detection
                     // is Windows/macOS-only, so other platforms skip the
                     // extra per-directory stat entirely.
-                    #[cfg(any(windows, target_os = "macos"))]
+                    #[cfg(windows)]
+                    {
+                        let mut listed = listing_metadata(dir_path);
+                        for entry in children.iter_mut().flatten() {
+                            entry.client_state = listed.remove(&entry.file_name);
+                            if entry.file_type.is_dir()
+                                && entry
+                                    .client_state
+                                    .as_ref()
+                                    .is_some_and(is_unpopulated_cloud_dir)
+                            {
+                                entry.read_children = None;
+                            }
+                        }
+                    }
+                    #[cfg(target_os = "macos")]
                     for entry in children.iter_mut().flatten() {
                         if entry.file_type.is_dir()
                             && let Ok(meta) = std::fs::metadata(entry.path())
@@ -301,11 +361,13 @@ pub fn walk_directories(
                             entry.read_children = None;
                         }
                     }
+                    #[cfg(not(windows))]
+                    let _ = dir_path;
                 }
             });
 
         for entry_res in walker {
-            let entry = match entry_res {
+            let mut entry = match entry_res {
                 Ok(e) => e,
                 Err(_) => continue,
             };
@@ -320,7 +382,11 @@ pub fn walk_directories(
                 intern_extension(path.extension().and_then(|ext| ext.to_str()))
             };
 
-            let (size, modified, dev, ino) = match entry.metadata() {
+            let meta = match entry.client_state.take() {
+                Some(meta) => Ok(meta),
+                None => entry.metadata().map_err(|_| ()),
+            };
+            let (size, modified, dev, ino) = match meta {
                 Ok(meta) => {
                     let sz = meta.len();
                     let mod_time = meta
@@ -350,10 +416,6 @@ pub fn walk_directories(
                 content_pending: false,
             };
 
-            if !include_ignored && is_dir {
-                ignore_dirs.push(path);
-            }
-
             result.push(file_entry);
         }
     }
@@ -364,7 +426,8 @@ pub fn walk_directories(
         let ignore_set = if include_ignored {
             IgnoreSet::empty()
         } else {
-            IgnoreSet::from_directories(&ignore_dirs)
+            let dirs = ignore_dirs.lock().map(|d| d.clone()).unwrap_or_default();
+            IgnoreSet::from_directories(&dirs)
         };
         // The watcher runs between crawls and has no directory list of its
         // own; it reads these rules so an edit inside an ignored tree does not

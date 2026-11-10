@@ -94,7 +94,8 @@ debug = false
 
 [features]
 # Compile the accurate PP-OCRv6 path into normal app builds. The engine still
-# defaults to Tesseract; the model pack is downloaded only when the user opts in.
+# defaults to Tesseract. Note: the PP-OCR and Indra model packs are also bundled
+# as installer resources (`tauri.conf.json`, `resources/**/*`), not only downloaded.
 default = ["accurate-ocr"]
 accurate-ocr = ["dep:paddleocr_rs_onnx", "dep:ort"]
 smart-embeddings = ["dep:ort"]

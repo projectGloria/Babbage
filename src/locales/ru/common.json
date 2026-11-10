@@ -69,5 +69,10 @@
   "stepper": {
     "decrease": "Уменьшить",
     "increase": "Увеличить"
+  },
+  "window": {
+    "minimize": "Свернуть",
+    "maximize": "Развернуть",
+    "close": "Закрыть окно"
   }
 }

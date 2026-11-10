@@ -804,7 +804,11 @@ pub(crate) fn decode_guarded(path: &Path) -> Option<DynamicImage> {
 /// that fail to decode, or exceed the pixel budget, return `None` instead of
 /// panicking.
 pub fn phash64(path: &Path) -> Option<u64> {
-    hash_image(&decode_guarded(path)?)
+    // Budgeted like OCR decodes: hashing and thumbnails used to reserve
+    // nothing, so a grid of uncached photos ran dozens of full-resolution
+    // decodes (~48 MB each at 12 MP) at once.
+    let (image, _permit) = decode_for_recognition(path)?;
+    hash_image(&image)
 }
 
 fn hash_image(image: &DynamicImage) -> Option<u64> {
@@ -876,7 +880,7 @@ pub fn thumbnail(path: &Path, out_dir: &Path) -> Option<PathBuf> {
         return Some(target);
     }
 
-    let image = decode_guarded(path)?;
+    let (image, _permit) = decode_for_recognition(path)?;
     std::fs::create_dir_all(out_dir).ok()?;
 
     let temp = out_dir.join(format!(

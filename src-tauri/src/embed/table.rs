@@ -72,14 +72,24 @@ impl StaticTable {
     pub fn load_with_f32_reason(dir: &Path, use_f32: bool) -> Result<Self, String> {
         let use_f32 = use_f32 || std::env::var_os("BABBAGE_F32_TABLE").is_some();
         let model_path = dir.join("model.safetensors");
-        let mut file = File::open(&model_path)
-            .map_err(|e| format!("cannot open {}: {e}", model_path.display()))?;
-        let (embeddings, vocab_size, dim) = parse_safetensors(&mut file).ok_or_else(|| {
-            format!(
-                "{} is not a readable safetensors matrix",
-                model_path.display()
-            )
-        })?;
+        // The quantised table is cached next to the source matrix, so a
+        // process start (every CLI call, every MCP server) reads 7 MB instead
+        // of reading 30 MB of f32 and quantising it again.
+        let cached = (!use_f32)
+            .then(|| q8_cache::read(&model_path))
+            .flatten();
+        let (embeddings, vocab_size, dim) = if let Some(cache) = cached.as_ref() {
+            (Vec::new(), cache.vocab_size, cache.dim)
+        } else {
+            let mut file = File::open(&model_path)
+                .map_err(|e| format!("cannot open {}: {e}", model_path.display()))?;
+            parse_safetensors(&mut file).ok_or_else(|| {
+                format!(
+                    "{} is not a readable safetensors matrix",
+                    model_path.display()
+                )
+            })?
+        };
         if dim != EMBEDDING_DIM {
             return Err(format!(
                 "{} has width {dim}, but this build expects {EMBEDDING_DIM}",
@@ -128,11 +138,14 @@ impl StaticTable {
         let (embeddings, embeddings_i8, embedding_scales): (Vec<f32>, Vec<i8>, Vec<f32>) =
             if use_f32 {
                 (embeddings, Vec::new(), Vec::new())
+        } else if let Some(cache) = cached {
+            (Vec::new(), cache.quantized, cache.scales)
         } else {
             // Quantize first, then drop the f32 matrix before returning so the
             // startup peak does not retain both representations.
             let (quantized, scales) = quantize(&embeddings, dim);
             drop(embeddings);
+            q8_cache::write(&model_path, vocab_size, dim, &quantized, &scales);
             (Vec::new(), quantized, scales)
         };
 
@@ -1049,5 +1062,122 @@ mod real_model_validation {
             i8_mrr + 0.01 >= f32_mrr,
             "i8 MRR {i8_mrr:.4} is more than 0.01 below f32 {f32_mrr:.4}"
         );
+    }
+}
+
+/// On-disk cache of the i8-quantised table (`model.q8` beside the matrix).
+///
+/// Keyed by the source file's size and mtime; any mismatch, short read or
+/// write failure simply falls back to quantising from the f32 source.
+mod q8_cache {
+    use std::io::{Read, Write};
+    use std::path::{Path, PathBuf};
+
+    const MAGIC: &[u8; 8] = b"BBGQ8v01";
+
+    pub struct Cached {
+        pub vocab_size: usize,
+        pub dim: usize,
+        pub quantized: Vec<i8>,
+        pub scales: Vec<f32>,
+    }
+
+    fn cache_path(model: &Path) -> PathBuf {
+        model.with_extension("q8")
+    }
+
+    fn source_key(model: &Path) -> Option<(u64, u64)> {
+        let meta = std::fs::metadata(model).ok()?;
+        let mtime = meta
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_nanos() as u64;
+        Some((meta.len(), mtime))
+    }
+
+    pub fn read(model: &Path) -> Option<Cached> {
+        let (size, mtime) = source_key(model)?;
+        let mut bytes = Vec::new();
+        std::fs::File::open(cache_path(model))
+            .ok()?
+            .read_to_end(&mut bytes)
+            .ok()?;
+        let header = 8 + 8 * 4;
+        if bytes.len() < header || &bytes[..8] != MAGIC {
+            return None;
+        }
+        let word = |i: usize| u64::from_le_bytes(bytes[8 + i * 8..16 + i * 8].try_into().unwrap());
+        if word(0) != size || word(1) != mtime {
+            return None;
+        }
+        let vocab_size = word(2) as usize;
+        let dim = word(3) as usize;
+        let cells = vocab_size.checked_mul(dim)?;
+        if bytes.len() != header + cells + vocab_size * 4 {
+            return None;
+        }
+        let quantized = bytes[header..header + cells].iter().map(|&b| b as i8).collect();
+        let scales = bytes[header + cells..]
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        Some(Cached {
+            vocab_size,
+            dim,
+            quantized,
+            scales,
+        })
+    }
+
+    pub fn write(model: &Path, vocab_size: usize, dim: usize, quantized: &[i8], scales: &[f32]) {
+        let Some((size, mtime)) = source_key(model) else {
+            return;
+        };
+        if quantized.len() != vocab_size * dim || scales.len() != vocab_size {
+            return;
+        }
+        let target = cache_path(model);
+        let temp = target.with_extension(format!("q8.{}.tmp", std::process::id()));
+        let result = (|| -> std::io::Result<()> {
+            let mut out = std::io::BufWriter::new(std::fs::File::create(&temp)?);
+            out.write_all(MAGIC)?;
+            for word in [size, mtime, vocab_size as u64, dim as u64] {
+                out.write_all(&word.to_le_bytes())?;
+            }
+            let raw: Vec<u8> = quantized.iter().map(|&b| b as u8).collect();
+            out.write_all(&raw)?;
+            for scale in scales {
+                out.write_all(&scale.to_le_bytes())?;
+            }
+            out.flush()?;
+            drop(out);
+            std::fs::rename(&temp, &target)
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temp);
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn round_trips_and_rejects_a_changed_source() {
+            let dir = std::env::temp_dir().join(format!("babbage-q8-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let model = dir.join("model.safetensors");
+            std::fs::write(&model, b"source").unwrap();
+            write(&model, 2, 3, &[1, -2, 3, -4, 5, -6], &[0.5, 0.25]);
+            let got = read(&model).expect("cache hit");
+            assert_eq!((got.vocab_size, got.dim), (2, 3));
+            assert_eq!(got.quantized, vec![1, -2, 3, -4, 5, -6]);
+            assert_eq!(got.scales, vec![0.5, 0.25]);
+            std::fs::write(&model, b"changed source").unwrap();
+            assert!(read(&model).is_none());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }

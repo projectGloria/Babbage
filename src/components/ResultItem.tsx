@@ -47,6 +47,12 @@ export const ResultItem = React.memo<ResultItemProps>(
         onClick={onSelect}
         onDoubleClick={onOpen}
         onMouseEnter={() => setHovered(true)}
+        // Hover selects (so Space previews the hovered row). mousemove, not
+        // mouseenter, so rows scrolling under a still cursor during arrow-key
+        // navigation don't steal the selection.
+        onMouseMove={() => {
+          if (!isSelected) onSelect();
+        }}
         onFocus={() => setHovered(true)}
         onContextMenu={(e) => {
           if (!onContextMenu) return;

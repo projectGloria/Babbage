@@ -26,6 +26,12 @@ pub fn release_memory() {
     }
 }
 
+/// Windows: return free blocks of the process heap (`HeapCompact`), the
+/// equivalent of glibc's `malloc_trim`. This used to call `EmptyWorkingSet`,
+/// which evicts *every* page of the process — the arena, the entries
+/// snapshot, the embedding table, Tantivy's mapped segments, ONNX weights —
+/// so the crawl and the next search paid a burst of page faults every five
+/// seconds for a lower Task Manager number.
 #[cfg(windows)]
 pub fn release_memory() {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -43,15 +49,35 @@ pub fn release_memory() {
             .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok()
     {
-        #[link(name = "psapi")]
         unsafe extern "system" {
-            fn EmptyWorkingSet(h_process: *mut core::ffi::c_void) -> i32;
-            fn GetCurrentProcess() -> *mut core::ffi::c_void;
+            fn GetProcessHeap() -> *mut core::ffi::c_void;
+            fn HeapCompact(h_heap: *mut core::ffi::c_void, flags: u32) -> usize;
         }
         unsafe {
-            let _ = EmptyWorkingSet(GetCurrentProcess());
+            let _ = HeapCompact(GetProcessHeap(), 0);
         }
     }
+}
+
+/// Trims the whole working set. Only for when the app goes idle in the tray
+/// (window destroyed), where a smaller resident set is the point and the
+/// next touch is a human-scale summon away; never on a hot path.
+#[cfg(windows)]
+pub fn trim_working_set() {
+    release_memory();
+    #[link(name = "psapi")]
+    unsafe extern "system" {
+        fn EmptyWorkingSet(h_process: *mut core::ffi::c_void) -> i32;
+        fn GetCurrentProcess() -> *mut core::ffi::c_void;
+    }
+    unsafe {
+        let _ = EmptyWorkingSet(GetCurrentProcess());
+    }
+}
+
+#[cfg(not(windows))]
+pub fn trim_working_set() {
+    release_memory();
 }
 
 #[cfg(not(any(

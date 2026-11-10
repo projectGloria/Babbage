@@ -331,6 +331,19 @@
 @keyframes dot-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
 .dot-pulse { animation: dot-pulse 1.6s ease-in-out infinite; }
 
+/* Searching: three dots rise and fade in sequence, centered and quiet. */
+.search-wave { display: flex; align-items: center; gap: 7px; height: 20px; }
+.search-wave > span {
+  width: 6px; height: 6px; border-radius: 9999px; background: var(--fg-muted);
+  animation: search-wave 1.2s var(--ease) infinite;
+}
+.search-wave > span:nth-child(2) { animation-delay: 150ms; }
+.search-wave > span:nth-child(3) { animation-delay: 300ms; }
+@keyframes search-wave {
+  0%, 60%, 100% { opacity: 0.25; transform: translateY(0) scale(0.85); }
+  30% { opacity: 1; transform: translateY(-6px) scale(1); }
+}
+
 @keyframes card-in { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
 .card-in { animation: card-in var(--dur-slow) var(--ease) both; animation-delay: var(--stagger-delay, 0ms); }
 

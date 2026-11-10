@@ -50,33 +50,29 @@ fn size_range_terms(field: Field, range: RangeOp) -> (Bound<Term>, Bound<Term>) 
 /// and `cl → d` make the longer spelling match the shorter query.
 pub fn fold(text: &str) -> String {
     let lower = text.to_lowercase();
-    let chars: Vec<char> = lower.chars().collect();
     let mut out = String::with_capacity(lower.len());
-    let mut index = 0;
-    while index < chars.len() {
-        match chars[index] {
-            'r' if chars.get(index + 1) == Some(&'n') => {
+    let mut chars = lower.chars().peekable();
+    while let Some(ch) = chars.next() {
+        let next = chars.peek().copied();
+        match (ch, next) {
+            ('r', Some('n')) => {
+                chars.next();
                 out.push('m');
-                index += 2;
-                continue;
             }
-            'v' if chars.get(index + 1) == Some(&'v') => {
+            ('v', Some('v')) => {
+                chars.next();
                 out.push('w');
-                index += 2;
-                continue;
             }
-            'c' if chars.get(index + 1) == Some(&'l') => {
+            ('c', Some('l')) => {
+                chars.next();
                 out.push('d');
-                index += 2;
-                continue;
             }
-            '0' => out.push('o'),
-            '1' | 'l' | '|' => out.push('i'),
-            '5' | '$' => out.push('s'),
-            '8' => out.push('b'),
-            other => out.push(other),
+            ('0', _) => out.push('o'),
+            ('1' | 'l' | '|', _) => out.push('i'),
+            ('5' | '$', _) => out.push('s'),
+            ('8', _) => out.push('b'),
+            (other, _) => out.push(other),
         }
-        index += 1;
     }
     out
 }
@@ -87,24 +83,39 @@ pub fn fold(text: &str) -> String {
 /// the OCR budget: one misread for 4–7 characters, two for 8+. Shorter terms
 /// must match exactly.
 pub fn verify_folded(raw: &str, query: &str) -> bool {
-    let lower = raw.to_lowercase();
-    let terms: Vec<&str> = query
+    let terms: Vec<String> = query
         .split(|ch: char| !ch.is_alphanumeric())
         .filter(|term| term.chars().count() >= 3)
+        .map(str::to_lowercase)
         .collect();
     if terms.is_empty() {
         return false;
     }
-    terms.iter().all(|term| term_matches(&lower, term))
-}
-
-fn term_matches(raw_lower: &str, term: &str) -> bool {
-    let term_lower = term.to_lowercase();
-    let folded_term = fold(&term_lower);
-    if raw_lower.contains(&term_lower) {
+    let lower = raw.to_lowercase();
+    // Exact occurrences first: a substring scan, no per-word work.
+    let pending: Vec<&String> = terms
+        .iter()
+        .filter(|term| !lower.contains(String::as_str(term)))
+        .collect();
+    if pending.is_empty() {
         return true;
     }
-    let budget = match folded_term.chars().count() {
+    // Fold every word once per document. This used to be redone per query
+    // term, twice per word, allocating a `Vec<char>` and a `String` each time.
+    let folded_words: Vec<String> = lower
+        .split(|ch: char| !ch.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(fold)
+        .collect();
+    pending
+        .iter()
+        .all(|term| term_matches_folded(&folded_words, term))
+}
+
+fn term_matches_folded(folded_words: &[String], term_lower: &str) -> bool {
+    let folded_term = fold(term_lower);
+    let needle: Vec<char> = folded_term.chars().collect();
+    let budget = match needle.len() {
         4..=7 => 1,
         8.. => 2,
         _ => 0,
@@ -112,24 +123,12 @@ fn term_matches(raw_lower: &str, term: &str) -> bool {
     if budget == 0 {
         // The two-character to one-character folds are exact mappings, so a
         // one-character folded term still has to match a whole folded word.
-        return raw_lower
-            .split(|ch: char| !ch.is_alphanumeric())
-            .filter(|word| !word.is_empty())
-            .any(|word| fold(word) == folded_term);
+        return folded_words.contains(&folded_term);
     }
-    let needle: Vec<char> = folded_term.chars().collect();
-    raw_lower
-        .split(|ch: char| !ch.is_alphanumeric())
-        .filter(|word| !word.is_empty())
-        .filter(|word| {
-            let folded_word = fold(word);
-            folded_word.chars().count().abs_diff(needle.len()) <= budget
-        })
-        .any(|word| {
-            let folded_word = fold(word);
-            let hay: Vec<char> = folded_word.chars().collect();
-            edit_distance_within(&needle, &hay.iter().collect::<String>(), budget)
-        })
+    folded_words.iter().any(|word| {
+        word.chars().count().abs_diff(needle.len()) <= budget
+            && edit_distance_within(&needle, word, budget)
+    })
 }
 
 fn edit_distance_within(needle: &[char], haystack: &str, budget: usize) -> bool {
@@ -310,7 +309,14 @@ pub struct ContentIndex {
     /// Reason recorded when an index was rebuilt during migration.
     pub rebuild_reason: Option<String>,
     snippet_cache: Mutex<SnippetCache>,
+    /// Doc id -> path for each live segment, read from the `path` term
+    /// dictionary. A ranked content hit only needs its path and mtime, but
+    /// loading the stored document decompressed its whole `content_raw` (up
+    /// to 4 MB) too, for up to 150 hits per keystroke.
+    segment_paths: Mutex<HashMap<tantivy::index::SegmentId, SegmentPaths>>,
 }
+
+type SegmentPaths = Arc<Vec<Option<Arc<str>>>>;
 
 #[derive(Debug, Clone)]
 pub struct ContentMatch {
@@ -488,12 +494,16 @@ impl ContentIndex {
             NgramTokenizer::new(3, 3, false).map_err(|e| e.to_string())?,
         );
 
-        // A desktop daemon should not reserve a large indexing arena. Tantivy
-        // requires ~15 MB per writer thread; one thread with a 16 MB arena keeps
-        // the resident footprint small. Indexing is I/O-bound for a personal
-        // corpus and extraction, not document insertion, is the real cost.
+        // Tantivy needs ~15 MB of arena per writer thread. One thread capped
+        // indexing throughput: the trigram field made insertion 3.5x slower,
+        // and 2/4 threads cut 1M-document time from 17.6 s to 9.3/5.3 s
+        // (docs/BENCHMARKS.md). Use up to 4 threads on machines that have
+        // the cores, 16 MB each, so memory stays bounded at 64 MB.
+        let writer_threads = std::thread::available_parallelism()
+            .map(|n| (n.get() / 4).clamp(1, 4))
+            .unwrap_or(1);
         let writer = index
-            .writer_with_num_threads(1, 16_000_000)
+            .writer_with_num_threads(writer_threads, 16_000_000 * writer_threads)
             .map_err(|e| e.to_string())?;
 
         let reader = index
@@ -517,6 +527,7 @@ impl ContentIndex {
             rebuilt,
             rebuild_reason,
             snippet_cache: Mutex::new(SnippetCache::new(32)),
+            segment_paths: Mutex::new(HashMap::new()),
         })
     }
 
@@ -579,6 +590,7 @@ impl ContentIndex {
             rebuilt: false,
             rebuild_reason: None,
             snippet_cache: Mutex::new(SnippetCache::new(32)),
+            segment_paths: Mutex::new(HashMap::new()),
         })
     }
 
@@ -628,9 +640,9 @@ impl ContentIndex {
         let path_str = path.to_string_lossy().to_string();
         let term = Term::from_field_text(self.path_field, &path_str);
 
-        let writer = self.writer()?.write();
-        writer.delete_term(term);
-
+        // Build the document (including the fold pass over the whole text)
+        // before taking the writer lock, so searches and other writers are
+        // not held behind it.
         let mut doc = doc!(
             self.path_field => path_str,
             self.filename_field => filename.to_string(),
@@ -651,6 +663,8 @@ impl ContentIndex {
         if let Some(field) = self.size_field {
             doc.add_u64(field, size);
         }
+        let writer = self.writer()?.write();
+        writer.delete_term(term);
         writer.add_document(doc).map_err(|e| e.to_string())?;
         Ok(())
     }
@@ -962,6 +976,15 @@ impl ContentIndex {
 
         let mut results = Vec::new();
         for (score, address) in top_docs {
+            // Scope check from the cached path map, before paying for the
+            // stored document (which carries the full raw text).
+            if let Some(prefix) = path_prefix
+                && self
+                    .path_for(&searcher, address)
+                    .is_some_and(|path| !path.starts_with(prefix))
+            {
+                continue;
+            }
             let Ok(document) = searcher.doc::<TantivyDocument>(address) else {
                 continue;
             };
@@ -1017,10 +1040,17 @@ impl ContentIndex {
     ) -> Box<dyn Query> {
         let mut clauses: Vec<(Occur, Box<dyn Query>)> = vec![(Occur::Must, base)];
         if let Some(prefix) = path_prefix.filter(|prefix| !prefix.is_empty()) {
-            let pattern = format!("(?s)^{}.*", regex::escape(prefix));
-            if let Ok(path_query) = RegexQuery::from_pattern(&pattern, self.path_field) {
-                clauses.push((Occur::Must, Box::new(path_query)));
-            }
+            // A term range over the `path` dictionary: a seek to the prefix
+            // and a contiguous scan, instead of running a regex automaton
+            // over every indexed path on each keystroke.
+            let upper = format!("{prefix}\u{10FFFF}");
+            clauses.push((
+                Occur::Must,
+                Box::new(RangeQuery::new(
+                    Bound::Included(Term::from_field_text(self.path_field, prefix)),
+                    Bound::Excluded(Term::from_field_text(self.path_field, &upper)),
+                )),
+            ));
         }
         clauses.extend(self.pushdown_clauses(filters));
         if clauses.len() == 1 {
@@ -1078,48 +1108,102 @@ impl ContentIndex {
             Err(_) => return Vec::new(),
         };
 
-        let mut results = Vec::new();
+        let mut results = Vec::with_capacity(top_docs.len());
+        let mut modified_columns: HashMap<u32, Option<tantivy::columnar::Column<u64>>> =
+            HashMap::new();
 
         for (score, doc_address) in top_docs {
-            if let Ok(retrieved_doc) = searcher.doc::<TantivyDocument>(doc_address) {
-                let path_str = retrieved_doc
-                    .get_first(self.path_field)
-                    .and_then(|f| f.as_str())
-                    .unwrap_or("")
-                    .to_string();
+            let Some(path_str) = self.path_for(&searcher, doc_address) else {
+                continue;
+            };
 
-                // Apply path prefix filter (pushed from scope)
-                if let Some(prefix) = path_prefix
-                    && !path_str.starts_with(prefix)
-                {
-                    continue;
-                }
-
-                let filename = retrieved_doc
-                    .get_first(self.filename_field)
-                    .and_then(|f| f.as_str())
-                    .unwrap_or("")
-                    .to_string();
-
-                let modified = retrieved_doc
-                    .get_first(self.modified_field)
-                    .and_then(|f| f.as_u64())
-                    .unwrap_or(0);
-
-                if !path_str.is_empty() {
-                    let path = PathBuf::from(&path_str);
-                    results.push(ContentMatch {
-                        path,
-                        filename,
-                        snippet: None,
-                        score,
-                        modified,
-                    });
-                }
+            // Apply path prefix filter (pushed from scope)
+            if let Some(prefix) = path_prefix
+                && !path_str.starts_with(prefix)
+            {
+                continue;
             }
+
+            let modified = modified_columns
+                .entry(doc_address.segment_ord)
+                .or_insert_with(|| {
+                    searcher
+                        .segment_reader(doc_address.segment_ord)
+                        .fast_fields()
+                        .u64("modified")
+                        .ok()
+                })
+                .as_ref()
+                .and_then(|column| column.first(doc_address.doc_id))
+                .unwrap_or(0);
+
+            let path = PathBuf::from(path_str.as_ref());
+            // The stored `filename` is the path's last component.
+            let filename = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            results.push(ContentMatch {
+                path,
+                filename,
+                snippet: None,
+                score,
+                modified,
+            });
         }
 
         results
+    }
+
+    /// Path of one document without loading its stored fields.
+    fn path_for(
+        &self,
+        searcher: &tantivy::Searcher,
+        address: tantivy::DocAddress,
+    ) -> Option<Arc<str>> {
+        let paths = self.segment_paths(searcher, address.segment_ord)?;
+        paths.get(address.doc_id as usize).cloned().flatten()
+    }
+
+    fn segment_paths(&self, searcher: &tantivy::Searcher, segment_ord: u32) -> Option<SegmentPaths> {
+        use tantivy::DocSet;
+        let segment = searcher.segment_reader(segment_ord);
+        let id = segment.segment_id();
+        if let Some(paths) = self.segment_paths.lock().get(&id) {
+            return Some(Arc::clone(paths));
+        }
+        let inverted = segment.inverted_index(self.path_field).ok()?;
+        let mut paths: Vec<Option<Arc<str>>> = vec![None; segment.max_doc() as usize];
+        let mut stream = inverted.terms().stream().ok()?;
+        while stream.advance() {
+            let Ok(text) = std::str::from_utf8(stream.key()) else {
+                continue;
+            };
+            let text: Arc<str> = Arc::from(text);
+            let Ok(mut postings) =
+                inverted.read_postings_from_terminfo(stream.value(), IndexRecordOption::Basic)
+            else {
+                continue;
+            };
+            let mut doc = postings.doc();
+            while doc != tantivy::TERMINATED {
+                if let Some(slot) = paths.get_mut(doc as usize) {
+                    *slot = Some(Arc::clone(&text));
+                }
+                doc = postings.advance();
+            }
+        }
+        let paths = Arc::new(paths);
+        let mut cache = self.segment_paths.lock();
+        // Drop maps for segments merged away or deleted since.
+        let live: HashSet<tantivy::index::SegmentId> = searcher
+            .segment_readers()
+            .iter()
+            .map(|reader| reader.segment_id())
+            .collect();
+        cache.retain(|segment_id, _| live.contains(segment_id));
+        cache.insert(id, Arc::clone(&paths));
+        Some(paths)
     }
 
     /// Returns the stored original text for one path, when the schema has it.
@@ -2152,7 +2236,7 @@ mod tests {
 
         add(
             index,
-            "/tmp/babbage/cjk/report.pdf",
+            "/tmp/babbage/cjk/最終報告書.pdf",
             "最終報告書.pdf",
             "東京大学の研究発表と2026年度予算",
         );
@@ -2164,13 +2248,13 @@ mod tests {
         );
         add(
             index,
-            "/tmp/babbage/cjk/readme.md",
+            "/tmp/babbage/cjk/README最終.md",
             "README最終.md",
             "Project documentation in English",
         );
         add(
             index,
-            "/tmp/babbage/cjk/comp.ts",
+            "/tmp/babbage/cjk/组件.ts",
             "组件.ts",
             "export const button = 1;",
         );

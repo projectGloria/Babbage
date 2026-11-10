@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo, lazy, Suspense } from "react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -14,17 +14,27 @@ import {
   BabbageConfig,
   DoctorReport,
 } from "./types";
-import { SetupModal } from "./components/SetupModal";
-import { DuplicatesModal } from "./components/DuplicatesModal";
 import { SlashMenu, SlashCommand } from "./components/SlashMenu";
 import { ScopeMenu } from "./components/ScopeMenu";
 import { ResultItem, ResultView } from "./components/ResultItem";
-import { Settings } from "./components/SettingsModal";
+// Rarely shown and heavy (Settings alone is ~1,800 lines, Setup ships a
+// large image): split out of the main chunk so a launcher summon, which
+// re-creates the webview, parses less before the first search.
+const SetupModal = lazy(() =>
+  import("./components/SetupModal").then((m) => ({ default: m.SetupModal })),
+);
+const DuplicatesModal = lazy(() =>
+  import("./components/DuplicatesModal").then((m) => ({ default: m.DuplicatesModal })),
+);
+const Settings = lazy(() =>
+  import("./components/SettingsModal").then((m) => ({ default: m.Settings })),
+);
 import { FilterChips } from "./components/FilterChips";
 import { KeyHintStrip } from "./components/KeyHintStrip";
 import { ContextMenu, ContextMenuItem } from "./components/ContextMenu";
 import { DetailsDialog } from "./components/DetailsDialog";
 import { HelpDialog } from "./components/HelpDialog";
+import { WindowControls } from "./components/WindowControls";
 import { SearchBar } from "./components/SearchBar";
 import { CategoryChips } from "./components/CategoryChips";
 import { ResultControls } from "./components/ResultControls";
@@ -34,7 +44,6 @@ import { normalizeTheme } from "./hooks/useTheme";
 import { useLanguage } from "./hooks/useLanguage";
 import { PreviewDialog } from "./components/PreviewDialog";
 import { classify } from "./lib/categories";
-import { shouldHideOnBlur } from "./lib/dismiss";
 import { useMeasuredHeight } from "./lib/useMeasuredHeight";
 import { interpretationLabel } from "./lib/interpretation";
 import { inFilter } from "./lib/query";
@@ -94,9 +103,28 @@ function App() {
       .catch(() => {});
   }, []);
 
+  // Persist the query for the next summon, debounced: it used to be one IPC
+  // round trip per keystroke. The latest value is flushed immediately when
+  // the window loses focus or is torn down (launcher hide).
+  const latestQueryRef = useRef(query);
   useEffect(() => {
-    invoke("remember_query", { query }).catch(() => {});
+    latestQueryRef.current = query;
+    const timer = window.setTimeout(() => {
+      invoke("remember_query", { query }).catch(() => {});
+    }, 300);
+    return () => window.clearTimeout(timer);
   }, [query]);
+  useEffect(() => {
+    const flush = () => {
+      invoke("remember_query", { query: latestQueryRef.current }).catch(() => {});
+    };
+    window.addEventListener("blur", flush);
+    window.addEventListener("pagehide", flush);
+    return () => {
+      window.removeEventListener("blur", flush);
+      window.removeEventListener("pagehide", flush);
+    };
+  }, []);
   const [results, setResults] = useState<SearchResult[]>([]);
   const [total, setTotal] = useState(0);
   const [activeFilters, setActiveFilters] = useState<ActiveFilter[]>([]);
@@ -991,49 +1019,7 @@ function App() {
     return () => window.removeEventListener("keydown", onEsc);
   }, [isSetupComplete, showSettings, showDuplicates, showHelp, preview, details, saveOpen, slashFilter, scopePrefix, commandOutput, query, config?.app_mode]);
 
-  // Dismiss like a launcher: hide when the window loses focus (clicking away,
-  // switching apps), unless a modal overlay is open. The setup wizard and
-  // native dialogs (folder picker, shortcut capture) also take focus away,
-  // and hiding there would destroy the window mid-decision.
-  //
-  // A blur is only a dismissal when the user moved focus to another
-  // application. Right-click and the OS-rendered popups some controls used to
-  // open also fire blur while the window is still the active one, and hiding
-  // on those made the launcher vanish mid-interaction. Two guards: skip when
-  // the document still reports focus, and skip for a short window after a
-  // pointer press or context menu, which is when a popup would be opening.
-  useEffect(() => {
-    // Set on pointerdown / contextmenu. A popup that steals focus opens
-    // within a frame or two of the press, so a short quiet period covers it
-    // while a genuine click-away still hides normally.
-    let lastInteractionAt = Number.NEGATIVE_INFINITY;
-    const markInteraction = () => {
-      lastInteractionAt = Date.now();
-    };
-
-    const onBlur = () => {
-      const hide = shouldHideOnBlur({
-        setupComplete: isSetupComplete === true,
-        appMode: config ? (config.app_mode ?? "launcher") : null,
-        overlayOpen: Boolean(
-          showSettings || showDuplicates || showHelp || preview || details || saveOpen || menu,
-        ),
-        documentFocused: document.hasFocus(),
-        msSinceInteraction: Date.now() - lastInteractionAt,
-      });
-      if (!hide) return;
-      invoke("hide_window").catch(() => undefined);
-    };
-
-    window.addEventListener("pointerdown", markInteraction, true);
-    window.addEventListener("contextmenu", markInteraction, true);
-    window.addEventListener("blur", onBlur);
-    return () => {
-      window.removeEventListener("pointerdown", markInteraction, true);
-      window.removeEventListener("contextmenu", markInteraction, true);
-      window.removeEventListener("blur", onBlur);
-    };
-  }, [isSetupComplete, showSettings, showDuplicates, showHelp, preview, details, saveOpen, menu, config?.app_mode]);
+  // Clicking outside never hides the window; Esc or the close button does.
 
   /* ---------------- render ---------------- */
 
@@ -1055,17 +1041,23 @@ function App() {
       onContextMenu={(e) => e.preventDefault()}
     >
       {isSetupComplete === false && (
-        <SetupModal
-          onSetupCompleted={() => {
-            setIsSetupComplete(true);
-            window.setTimeout(() => inputRef.current?.focus(), 120);
-          }}
-        />
+        <Suspense fallback={null}>
+          <SetupModal
+            onSetupCompleted={() => {
+              setIsSetupComplete(true);
+              window.setTimeout(() => inputRef.current?.focus(), 120);
+            }}
+          />
+        </Suspense>
       )}
 
       {isSetupComplete === true && (
         <>
-          {showDuplicates && <DuplicatesModal onClose={() => setShowDuplicates(false)} />}
+          {showDuplicates && (
+            <Suspense fallback={null}>
+              <DuplicatesModal onClose={() => setShowDuplicates(false)} />
+            </Suspense>
+          )}
           {menu && (
             <ContextMenu
               x={menu.x}
@@ -1093,13 +1085,15 @@ function App() {
           {/* Search bar */}
           {showSettings && (
             <div className="absolute inset-0 z-40">
-              <Settings
-                onClose={() => setShowSettings(false)}
-                initialSection={settingsSection}
-                onConfigSaved={() => {
-                  invoke<IndexingStatus>("get_indexing_status").then(setIndexingStatus);
-                }}
-              />
+              <Suspense fallback={null}>
+                <Settings
+                  onClose={() => setShowSettings(false)}
+                  initialSection={settingsSection}
+                  onConfigSaved={() => {
+                    invoke<IndexingStatus>("get_indexing_status").then(setIndexingStatus);
+                  }}
+                />
+              </Suspense>
             </div>
           )}
 
@@ -1115,6 +1109,7 @@ function App() {
                 resultCount={results.length}
                 total={total}
                 searching={searchPending}
+                windowControls={config && config.app_mode !== "app" ? <WindowControls /> : undefined}
                 trailing={
                   <button
                     type="button"
@@ -1319,18 +1314,16 @@ function App() {
                   ) : hasQuery ? (noResults && searchPending ? (
                     /* Delayed fade so a fast search never flashes this. */
                     <div
-                      className="fade-in flex h-full flex-col items-start justify-end px-4 pb-8 select-none"
+                      className="fade-in flex h-full items-center justify-center select-none"
                       style={{ animationDelay: "150ms" }}
                       role="status"
+                      aria-label={t("searching")}
                     >
-                      <p className="t-moment max-w-lg text-muted">
-                        {t("searching")}
-                        <span aria-hidden="true">
-                          <span className="dot-pulse">.</span>
-                          <span className="dot-pulse" style={{ animationDelay: "200ms" }}>.</span>
-                          <span className="dot-pulse" style={{ animationDelay: "400ms" }}>.</span>
-                        </span>
-                      </p>
+                      <div className="search-wave" aria-hidden="true">
+                        <span />
+                        <span />
+                        <span />
+                      </div>
                     </div>
                   ) : noResults ? (
                     <div className="flex h-full flex-col items-start justify-end gap-4 px-4 pb-8 select-none">

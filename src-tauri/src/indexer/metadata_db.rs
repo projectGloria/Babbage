@@ -16,6 +16,23 @@ pub struct MetadataDb {
     conn: Mutex<Connection>,
 }
 
+const UPSERT_NODE_SQL: &str = "INSERT INTO nodes (path, name, extension, size, modified, is_dir, dev, ino, content_pending)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(path) DO UPDATE SET
+               name = excluded.name,
+               extension = excluded.extension,
+               size = excluded.size,
+               modified = excluded.modified,
+               is_dir = excluded.is_dir,
+               dev = excluded.dev,
+               ino = excluded.ino,
+               width = CASE WHEN nodes.modified != excluded.modified OR nodes.size != excluded.size THEN NULL ELSE nodes.width END,
+               height = CASE WHEN nodes.modified != excluded.modified OR nodes.size != excluded.size THEN NULL ELSE nodes.height END,
+               phash = CASE WHEN nodes.modified != excluded.modified OR nodes.size != excluded.size THEN NULL ELSE nodes.phash END,
+               indexed_gen = CASE WHEN nodes.modified != excluded.modified OR nodes.size != excluded.size THEN 0 ELSE nodes.indexed_gen END,
+               retry_count = CASE WHEN nodes.modified != excluded.modified OR nodes.size != excluded.size THEN 0 ELSE nodes.retry_count END
+             RETURNING id";
+
 impl MetadataDb {
     pub fn begin_transaction(&self) -> Result<(), String> {
         let conn = self.conn.lock();
@@ -29,6 +46,23 @@ impl MetadataDb {
         conn.execute("COMMIT", [])
             .map_err(|e| format!("Failed to commit transaction: {}", e))?;
         Ok(())
+    }
+
+    /// Commits the open batch transaction, if any, and starts a new one.
+    ///
+    /// The crawl used to hold a single transaction from walk to end while
+    /// Tantivy committed every 512 documents: a crash kept the Tantivy
+    /// segments but lost every metadata row and unit, so the next launch
+    /// re-extracted (and re-OCR'd) everything, and the WAL could not be
+    /// checkpointed for the whole crawl. Called at each content commit so
+    /// both stores advance together.
+    pub fn checkpoint_transaction(&self) -> Result<(), String> {
+        let conn = self.conn.lock();
+        if conn.is_autocommit() {
+            return Ok(());
+        }
+        conn.execute_batch("COMMIT; BEGIN")
+            .map_err(|e| format!("Failed to checkpoint transaction: {}", e))
     }
 
     pub fn open() -> Result<Self, String> {
@@ -76,7 +110,9 @@ impl MetadataDb {
                dev INTEGER NOT NULL DEFAULT 0,
                ino INTEGER NOT NULL DEFAULT 0
              );
-             CREATE INDEX IF NOT EXISTS nodes_path ON nodes(path);
+             -- `path` is UNIQUE, which already indexes it; a second
+             -- index on the same column only slowed every write.
+             DROP INDEX IF EXISTS nodes_path;
              CREATE TABLE IF NOT EXISTS usage (
                path TEXT PRIMARY KEY,
                opens INTEGER NOT NULL DEFAULT 0,
@@ -145,7 +181,7 @@ impl MetadataDb {
             )
             .ok();
         if stored_version.as_deref() != Some(IMAGE_HASH_VERSION) {
-            let _ = conn.execute("UPDATE nodes SET phash = NULL", []);
+            let _ = conn.prepare_cached("UPDATE nodes SET phash = NULL").and_then(|mut stmt| stmt.execute([]));
             let _ = conn.execute(
                 "INSERT OR REPLACE INTO meta (key, value) VALUES ('image_hash_version', ?1)",
                 [IMAGE_HASH_VERSION],
@@ -204,7 +240,11 @@ impl MetadataDb {
         }
 
         let db = Self {
-            conn: Mutex::new(conn),
+            conn: Mutex::new({
+                // ~25 hot statements are cached; the default holds 16.
+                conn.set_prepared_statement_cache_capacity(64);
+                conn
+            }),
         };
 
         // Reclaim a bloated free list at startup. Best-effort: a busy or
@@ -324,23 +364,12 @@ impl MetadataDb {
     /// of re-querying the database (or, worse, re-reading the file later).
     pub fn upsert(&self, entry: &FileEntry) -> Result<u64, String> {
         let conn = self.conn.lock();
-        conn.query_row(
-            "INSERT INTO nodes (path, name, extension, size, modified, is_dir, dev, ino, content_pending)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-             ON CONFLICT(path) DO UPDATE SET
-               name = excluded.name,
-               extension = excluded.extension,
-               size = excluded.size,
-               modified = excluded.modified,
-               is_dir = excluded.is_dir,
-               dev = excluded.dev,
-               ino = excluded.ino,
-               width = CASE WHEN nodes.modified != excluded.modified OR nodes.size != excluded.size THEN NULL ELSE nodes.width END,
-               height = CASE WHEN nodes.modified != excluded.modified OR nodes.size != excluded.size THEN NULL ELSE nodes.height END,
-               phash = CASE WHEN nodes.modified != excluded.modified OR nodes.size != excluded.size THEN NULL ELSE nodes.phash END,
-               indexed_gen = CASE WHEN nodes.modified != excluded.modified OR nodes.size != excluded.size THEN 0 ELSE nodes.indexed_gen END,
-               retry_count = CASE WHEN nodes.modified != excluded.modified OR nodes.size != excluded.size THEN 0 ELSE nodes.retry_count END
-             RETURNING id",
+        // Cached: this runs once per new or changed file during a crawl.
+        let mut stmt = conn
+            .prepare_cached(UPSERT_NODE_SQL)
+            .map_err(|e| format!("Failed to prepare upsert: {}", e))?;
+        stmt.query_row(
+
             params![
                 entry.path.to_string_lossy().to_string(),
                 entry.name,
@@ -358,14 +387,44 @@ impl MetadataDb {
         .map_err(|e| format!("Failed to upsert metadata entry: {}", e))
     }
 
+    /// Deletes many rows in one savepoint with prepared statements; nests
+    /// safely inside an outer transaction.
+    pub fn remove_many(&self, paths: &[PathBuf]) -> Result<(), String> {
+        let mut conn = self.conn.lock();
+        let sp = conn
+            .savepoint()
+            .map_err(|e| format!("Failed to begin delete: {}", e))?;
+        {
+            let mut units = sp
+                .prepare_cached(
+                    "DELETE FROM units WHERE node_id IN (SELECT id FROM nodes WHERE path = ?1)",
+                )
+                .map_err(|e| e.to_string())?;
+            let mut nodes = sp
+                .prepare_cached("DELETE FROM nodes WHERE path = ?1")
+                .map_err(|e| e.to_string())?;
+            for path in paths {
+                let path_str = path.to_string_lossy();
+                let _ = units.execute(params![path_str.as_ref()]);
+                nodes
+                    .execute(params![path_str.as_ref()])
+                    .map_err(|e| format!("Failed to delete metadata entry: {}", e))?;
+            }
+        }
+        sp.commit()
+            .map_err(|e| format!("Failed to commit delete: {}", e))
+    }
+
     pub fn remove(&self, path: &Path) -> Result<(), String> {
         let conn = self.conn.lock();
         let path_str = path.to_string_lossy().to_string();
-        let _ = conn.execute(
+        if let Ok(mut stmt) = conn.prepare_cached(
             "DELETE FROM units WHERE node_id IN (SELECT id FROM nodes WHERE path = ?1)",
-            params![path_str],
-        );
-        conn.execute("DELETE FROM nodes WHERE path = ?1", params![path_str])
+        ) {
+            let _ = stmt.execute(params![path_str]);
+        }
+        conn.prepare_cached("DELETE FROM nodes WHERE path = ?1")
+            .and_then(|mut stmt| stmt.execute(params![path_str]))
             .map_err(|e| format!("Failed to delete metadata entry: {}", e))?;
 
         Ok(())
@@ -451,9 +510,9 @@ impl MetadataDb {
 
     pub fn clear(&self) -> Result<(), String> {
         let conn = self.conn.lock();
-        let _ = conn.execute("DELETE FROM units", []);
-        let _ = conn.execute("DELETE FROM usage", []);
-        conn.execute("DELETE FROM nodes", [])
+        let _ = conn.prepare_cached("DELETE FROM units").and_then(|mut stmt| stmt.execute([]));
+        let _ = conn.prepare_cached("DELETE FROM usage").and_then(|mut stmt| stmt.execute([]));
+        conn.prepare_cached("DELETE FROM nodes").and_then(|mut stmt| stmt.execute([]))
             .map_err(|e| format!("Failed to clear metadata: {}", e))?;
 
         Ok(())
@@ -476,7 +535,10 @@ impl MetadataDb {
         let conn = self.conn.lock();
         let total: i64 = conn
             .query_row(
-                "SELECT COALESCE(SUM(LENGTH(vec)), 0) FROM units",
+                // Every unit in a store has the same dimension, so count rows
+                // (an index scan) instead of reading every vector blob. The
+                // stats panel polls this every two seconds while it is open.
+                "SELECT COUNT(*) * COALESCE((SELECT LENGTH(vec) FROM units LIMIT 1), 0) FROM units",
                 [],
                 |row| row.get(0),
             )
@@ -504,11 +566,8 @@ impl MetadataDb {
             .duration_since(SystemTime::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        conn.execute(
-            "INSERT INTO usage (path, opens, last_open) VALUES (?1, 1, ?2)
-             ON CONFLICT(path) DO UPDATE SET opens = opens + 1, last_open = excluded.last_open",
-            params![path.to_string_lossy().to_string(), now as i64],
-        )
+        conn.prepare_cached("INSERT INTO usage (path, opens, last_open) VALUES (?1, 1, ?2)
+             ON CONFLICT(path) DO UPDATE SET opens = opens + 1, last_open = excluded.last_open").and_then(|mut stmt| stmt.execute(params![path.to_string_lossy().to_string(), now as i64]))
         .map_err(|e| format!("Failed to record file open: {}", e))?;
         Ok(())
     }
@@ -548,16 +607,13 @@ impl MetadataDb {
     ) -> Result<u64, String> {
         let conn = self.conn.lock();
         let u8_vec: Vec<u8> = vector.iter().map(|&b| b as u8).collect();
-        conn.execute(
-            "INSERT INTO units (node_id, byte_start, byte_end, model_id, vec) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
+        conn.prepare_cached("INSERT INTO units (node_id, byte_start, byte_end, model_id, vec) VALUES (?1, ?2, ?3, ?4, ?5)").and_then(|mut stmt| stmt.execute(params![
                 node_id as i64,
                 byte_start as i64,
                 byte_end as i64,
                 model_id as i64,
                 u8_vec,
-            ],
-        )
+            ]))
         .map_err(|e| format!("Failed to insert unit: {}", e))?;
         Ok(conn.last_insert_rowid() as u64)
     }
@@ -634,10 +690,7 @@ impl MetadataDb {
 
     pub fn delete_units_for_node(&self, node_id: u64) -> Result<(), String> {
         let conn = self.conn.lock();
-        conn.execute(
-            "DELETE FROM units WHERE node_id = ?1",
-            params![node_id as i64],
-        )
+        conn.prepare_cached("DELETE FROM units WHERE node_id = ?1").and_then(|mut stmt| stmt.execute(params![node_id as i64]))
         .map_err(|e| format!("Failed to delete units for node: {}", e))?;
         Ok(())
     }
@@ -737,7 +790,7 @@ impl MetadataDb {
 
     pub fn reset_visual_index(&self) -> Result<(), String> {
         let conn = self.conn.lock();
-        conn.execute("DELETE FROM visual_units", [])
+        conn.prepare_cached("DELETE FROM visual_units").and_then(|mut stmt| stmt.execute([]))
             .map_err(|e| format!("Failed to reset visual units: {}", e))?;
         Ok(())
     }
@@ -874,7 +927,7 @@ impl MetadataDb {
         let Some((id, Some(burst))) = row else {
             return Ok(Vec::new());
         };
-        conn.execute("UPDATE nodes SET burst = NULL WHERE id = ?1", params![id])
+        conn.prepare_cached("UPDATE nodes SET burst = NULL WHERE id = ?1").and_then(|mut stmt| stmt.execute(params![id]))
             .map_err(|e| format!("Failed to detach burst row: {}", e))?;
         if burst != id {
             return Ok(Vec::new());
@@ -889,10 +942,7 @@ impl MetadataDb {
         let Some(next) = next else {
             return Ok(Vec::new());
         };
-        conn.execute(
-            "UPDATE nodes SET burst = ?1 WHERE burst = ?2 AND id <> ?3",
-            params![next, burst, id],
-        )
+        conn.prepare_cached("UPDATE nodes SET burst = ?1 WHERE burst = ?2 AND id <> ?3").and_then(|mut stmt| stmt.execute(params![next, burst, id]))
         .map_err(|e| format!("Failed to re-home burst members: {}", e))?;
         let mut statement = conn
             .prepare("SELECT path, burst FROM nodes WHERE burst = ?1 ORDER BY id")
@@ -927,12 +977,9 @@ impl MetadataDb {
         let conn = self.conn.lock();
         let path = path.to_string_lossy().to_string();
         let updates = Self::detach_burst(&conn, &path)?;
-        conn.execute(
-            "UPDATE nodes SET width = ?1, height = ?2, phash = ?3, look = ?3,
+        conn.prepare_cached("UPDATE nodes SET width = ?1, height = ?2, phash = ?3, look = ?3,
                 burst = NULL, text_sig = NULL
-             WHERE path = ?4",
-            params![i64::from(width), i64::from(height), phash as i64, path],
-        )
+             WHERE path = ?4").and_then(|mut stmt| stmt.execute(params![i64::from(width), i64::from(height), phash as i64, path]))
         .map_err(|e| format!("Failed to store image metadata: {}", e))?;
         Ok(updates)
     }
@@ -944,14 +991,11 @@ impl MetadataDb {
     /// the background backfill so it never gates OCR or index commits.
     pub fn set_image_dimensions(&self, path: &Path, width: u32, height: u32) -> Result<(), String> {
         let conn = self.conn.lock();
-        conn.execute(
-            "UPDATE nodes SET width = ?1, height = ?2 WHERE path = ?3",
-            params![
+        conn.prepare_cached("UPDATE nodes SET width = ?1, height = ?2 WHERE path = ?3").and_then(|mut stmt| stmt.execute(params![
                 i64::from(width),
                 i64::from(height),
                 path.to_string_lossy().to_string(),
-            ],
-        )
+            ]))
         .map_err(|e| format!("Failed to store image dimensions: {}", e))?;
         Ok(())
     }
@@ -962,10 +1006,7 @@ impl MetadataDb {
     /// exclude it from duplicate grouping and from the missing-hash scan.
     pub fn set_image_phash(&self, path: &Path, phash: u64) -> Result<(), String> {
         let conn = self.conn.lock();
-        conn.execute(
-            "UPDATE nodes SET phash = ?1, look = ?1 WHERE path = ?2",
-            params![phash as i64, path.to_string_lossy().to_string()],
-        )
+        conn.prepare_cached("UPDATE nodes SET phash = ?1, look = ?1 WHERE path = ?2").and_then(|mut stmt| stmt.execute(params![phash as i64, path.to_string_lossy().to_string()]))
         .map_err(|e| format!("Failed to store image hash: {}", e))?;
         Ok(())
     }
@@ -977,10 +1018,7 @@ impl MetadataDb {
         let conn = self.conn.lock();
         let path = path.to_string_lossy().to_string();
         let updates = Self::detach_burst(&conn, &path)?;
-        conn.execute(
-            "UPDATE nodes SET phash = NULL, look = NULL, burst = NULL WHERE path = ?1",
-            params![path],
-        )
+        conn.prepare_cached("UPDATE nodes SET phash = NULL, look = NULL, burst = NULL WHERE path = ?1").and_then(|mut stmt| stmt.execute(params![path]))
         .map_err(|e| format!("Failed to clear image hash: {}", e))?;
         Ok(updates)
     }
@@ -997,10 +1035,7 @@ impl MetadataDb {
         let conn = self.conn.lock();
         let path = path.to_string_lossy().to_string();
         let updates = Self::detach_burst(&conn, &path)?;
-        conn.execute(
-            "UPDATE nodes SET text_sig = ?1, burst = NULL WHERE path = ?2",
-            params![signature, path],
-        )
+        conn.prepare_cached("UPDATE nodes SET text_sig = ?1, burst = NULL WHERE path = ?2").and_then(|mut stmt| stmt.execute(params![signature, path]))
         .map_err(|e| format!("Failed to store image text signature: {}", e))?;
         Ok(updates)
     }
@@ -1267,12 +1302,9 @@ impl MetadataDb {
     /// Returns the number of rows updated.
     pub fn mark_images_pending(&self) -> Result<usize, String> {
         let conn = self.conn.lock();
-        conn.execute(
-            "UPDATE nodes SET content_pending = 1
+        conn.prepare_cached("UPDATE nodes SET content_pending = 1
              WHERE is_dir = 0
-               AND lower(extension) IN ('png','jpg','jpeg','gif','webp','bmp','tiff','tif')",
-            [],
-        )
+               AND lower(extension) IN ('png','jpg','jpeg','gif','webp','bmp','tiff','tif')").and_then(|mut stmt| stmt.execute([]))
         .map_err(|e| format!("Failed to mark images pending: {}", e))
     }
 
@@ -1301,20 +1333,31 @@ impl MetadataDb {
     /// Marks every file as needing a content re-read.
     pub fn mark_all_content_pending(&self) -> Result<usize, String> {
         let conn = self.conn.lock();
-        conn.execute(
-            "UPDATE nodes SET content_pending = 1, retry_count = 0 WHERE is_dir = 0",
-            [],
-        )
+        conn.prepare_cached("UPDATE nodes SET content_pending = 1, retry_count = 0 WHERE is_dir = 0").and_then(|mut stmt| stmt.execute([]))
             .map_err(|e| format!("Failed to mark all content pending: {}", e))
+    }
+
+    /// Sets or clears `content_pending` for rows by id, with one cached
+    /// statement. Touches SQLite only: the in-memory flag keeps its own
+    /// meaning for the running crawl.
+    pub fn set_pending_by_ids(&self, ids: &[u64], pending: bool) -> Result<(), String> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare_cached("UPDATE nodes SET content_pending = ?1 WHERE id = ?2")
+            .map_err(|e| e.to_string())?;
+        for &id in ids {
+            if id > 0 {
+                stmt.execute(params![pending as i64, id as i64])
+                    .map_err(|e| format!("Failed to update pending flag: {}", e))?;
+            }
+        }
+        Ok(())
     }
 
     /// Sets the pending flag for a single path.
     pub fn set_content_pending(&self, path: &Path) -> Result<(), String> {
         let conn = self.conn.lock();
-        conn.execute(
-            "UPDATE nodes SET content_pending = 1 WHERE path = ?1",
-            params![path.to_string_lossy().to_string()],
-        )
+        conn.prepare_cached("UPDATE nodes SET content_pending = 1 WHERE path = ?1").and_then(|mut stmt| stmt.execute(params![path.to_string_lossy().to_string()]))
         .map_err(|e| format!("Failed to mark '{}' pending: {}", path.display(), e))?;
         Ok(())
     }
@@ -1330,10 +1373,7 @@ impl MetadataDb {
     pub fn record_retry(&self, path: &Path, max_attempts: u32) -> Result<bool, String> {
         let path_str = path.to_string_lossy().to_string();
         let conn = self.conn.lock();
-        conn.execute(
-            "UPDATE nodes SET retry_count = retry_count + 1 WHERE path = ?1",
-            params![&path_str],
-        )
+        conn.prepare_cached("UPDATE nodes SET retry_count = retry_count + 1 WHERE path = ?1").and_then(|mut stmt| stmt.execute(params![&path_str]))
         .map_err(|e| format!("Failed to record a retry for '{}': {}", path.display(), e))?;
         let attempts: i64 = conn
             .query_row(
@@ -1346,10 +1386,7 @@ impl MetadataDb {
             // Stop retrying until the file changes or OCR settings change.
             // `content_pending` cleared means the next crawl skips it, so the
             // launch reconcile goes quiet instead of repeating the same cost.
-            conn.execute(
-                "UPDATE nodes SET content_pending = 0 WHERE path = ?1",
-                params![&path_str],
-            )
+            conn.prepare_cached("UPDATE nodes SET content_pending = 0 WHERE path = ?1").and_then(|mut stmt| stmt.execute(params![&path_str]))
             .map_err(|e| format!("Failed to stop retrying '{}': {}", path.display(), e))?;
             return Ok(false);
         }
@@ -1360,22 +1397,16 @@ impl MetadataDb {
     /// produces changed, and scanned PDFs are OCR'd too.
     pub fn mark_ocr_targets_pending(&self) -> Result<usize, String> {
         let conn = self.conn.lock();
-        conn.execute(
-            "UPDATE nodes SET content_pending = 1, retry_count = 0
+        conn.prepare_cached("UPDATE nodes SET content_pending = 1, retry_count = 0
              WHERE is_dir = 0
-               AND lower(extension) IN ('png','jpg','jpeg','gif','webp','bmp','tiff','tif','pdf')",
-            [],
-        )
+               AND lower(extension) IN ('png','jpg','jpeg','gif','webp','bmp','tiff','tif','pdf')").and_then(|mut stmt| stmt.execute([]))
         .map_err(|e| format!("Failed to mark OCR targets pending: {}", e))
     }
 
     /// Clears the pending flag for a single path.
     pub fn clear_content_pending(&self, path: &Path) -> Result<(), String> {
         let conn = self.conn.lock();
-        conn.execute(
-            "UPDATE nodes SET content_pending = 0 WHERE path = ?1",
-            params![path.to_string_lossy().to_string()],
-        )
+        conn.prepare_cached("UPDATE nodes SET content_pending = 0 WHERE path = ?1").and_then(|mut stmt| stmt.execute(params![path.to_string_lossy().to_string()]))
         .map_err(|e| {
             format!(
                 "Failed to clear pending content for '{}': {}",

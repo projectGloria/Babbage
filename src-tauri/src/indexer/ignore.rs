@@ -111,16 +111,23 @@ impl IgnoreSet {
         }
         // Applicable rule groups, ordered shallow → deep so deeper files
         // override shallower ones.
-        let mut applicable: Vec<(&Path, &[Rule])> = self
-            .rules
-            .iter()
-            .filter(|(dir, _)| path.starts_with(*dir))
-            .map(|(dir, rules)| (dir.as_path(), rules.as_slice()))
-            .collect();
+        // Look up the path's own ancestors (O(depth) map probes) instead of
+        // testing every rule group against every path, which made the
+        // post-walk filter O(entries x ignore files): 34 s of a 35 s walk
+        // over a 123k-entry tree with many `.gitignore`s.
+        let mut applicable: Vec<(&Path, &[Rule])> = Vec::new();
+        let mut cursor = Some(path);
+        while let Some(dir) = cursor {
+            if let Some((key, rules)) = self.rules.get_key_value(dir) {
+                applicable.push((key.as_path(), rules.as_slice()));
+            }
+            cursor = dir.parent();
+        }
         if applicable.is_empty() {
             return false;
         }
-        applicable.sort_by_key(|(dir, _)| dir.as_os_str().len());
+        // Shallow → deep.
+        applicable.reverse();
 
         let mut ignored = false;
         for (dir, rules) in applicable {

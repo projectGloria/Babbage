@@ -172,6 +172,7 @@ pub async fn search(
     state: State<'_, AppState>,
 ) -> Result<SearchResponse, String> {
     let started = Instant::now();
+    let _searching = crate::tray_icon::SearchGuard::start();
     let req_seq = seq.unwrap_or_else(|| CURRENT_SEARCH_SEQ.fetch_add(1, Ordering::SeqCst) + 1);
     CURRENT_SEARCH_SEQ.store(req_seq, Ordering::SeqCst);
 
@@ -187,40 +188,53 @@ pub async fn search(
         return Ok(resp);
     }
 
-    let indexer = &state.indexer;
-    indexer.query_in_flight.store(true, Ordering::SeqCst);
+    let indexer = std::sync::Arc::clone(&state.indexer);
+    // CPU-bound: run on a blocking thread, not an async-runtime worker, and
+    // inside the dedicated query pool so the crawl can never hold it.
+    let resp = tauri::async_runtime::spawn_blocking(move || {
+        // A newer keystroke already arrived: skip the work entirely. The
+        // frontend discards stale responses by `seq` anyway.
+        if CURRENT_SEARCH_SEQ.load(Ordering::SeqCst) != req_seq {
+            return SearchResponse {
+                seq: req_seq,
+                ..SearchResponse::default()
+            };
+        }
+        let _in_flight = indexer.query_in_flight.enter();
+        crate::util::pools::query_pool().install(|| {
+            let metadata = indexer.metadata.read();
+            let content_index = indexer.content_index.read();
+            let unit_store = indexer.unit_store.read();
+            let (max_results, semantic_enabled, aliases) = {
+                let cfg = indexer.config.read();
+                (cfg.max_results, cfg.semantic_enabled, cfg.alias_pairs())
+            };
+            // The UI asks for snippets separately (`get_snippets`) so the
+            // search itself never touches file contents.
+            let sort = sort
+                .as_deref()
+                .map(crate::search::SortOrder::parse)
+                .unwrap_or_default();
+            let visual_store = indexer.visual_store.read();
+            SearchDispatcher::search_response_fast_sorted_with_snippets_and_visual(
+                &query,
+                &metadata,
+                &content_index,
+                Some(&unit_store),
+                Some(&visual_store),
+                semantic_enabled,
+                max_results,
+                req_seq,
+                sort,
+                &aliases,
+                offset.unwrap_or(0),
+                false,
+            )
+        })
+    })
+    .await
+    .map_err(|e| format!("Search task failed: {}", e))?;
 
-    let metadata = indexer.metadata.read();
-    let content_index = indexer.content_index.read();
-    let unit_store = indexer.unit_store.read();
-    let cfg = indexer.config.read();
-    let max_results = cfg.max_results;
-    let semantic_enabled = cfg.semantic_enabled;
-    let aliases = cfg.alias_pairs();
-
-    // The UI asks for snippets separately (`get_snippets`) so the search
-    // itself never touches file contents.
-    let sort = sort
-        .as_deref()
-        .map(crate::search::SortOrder::parse)
-        .unwrap_or_default();
-    let visual_store = indexer.visual_store.read();
-    let resp = SearchDispatcher::search_response_fast_sorted_with_snippets_and_visual(
-        &query,
-        &metadata,
-        &content_index,
-        Some(&unit_store),
-        Some(&visual_store),
-        semantic_enabled,
-        max_results,
-        req_seq,
-        sort,
-        &aliases,
-        offset.unwrap_or(0),
-        false,
-    );
-
-    indexer.query_in_flight.store(false, Ordering::SeqCst);
     record_query_latency(started.elapsed().as_micros() as u64);
     Ok(resp)
 }
@@ -261,7 +275,7 @@ pub fn compute_snippets(paths: Vec<String>, query: &str) -> Vec<SnippetDto> {
     use rayon::prelude::*;
 
     let paths: Vec<String> = paths.into_iter().take(MAX_SNIPPET_PATHS).collect();
-    paths
+    crate::util::pools::query_pool().install(|| paths
         .par_iter()
         .map(|path| {
             let snippet = crate::indexer::content::snippet_for_path(Path::new(path), query)
@@ -271,7 +285,7 @@ pub fn compute_snippets(paths: Vec<String>, query: &str) -> Vec<SnippetDto> {
                 snippet,
             }
         })
-        .collect()
+        .collect())
 }
 
 #[tauri::command]
@@ -292,7 +306,7 @@ pub async fn legacy_search(
     }
 
     let indexer = &state.indexer;
-    indexer.query_in_flight.store(true, Ordering::SeqCst);
+    let _in_flight = indexer.query_in_flight.enter();
 
     let metadata = indexer.metadata.read();
     let content_index = indexer.content_index.read();
@@ -301,16 +315,17 @@ pub async fn legacy_search(
     let max_results = cfg.max_results;
     let semantic_enabled = cfg.semantic_enabled;
 
-    let results = SearchDispatcher::search(
-        &query,
-        &metadata,
-        &content_index,
-        Some(&unit_store),
-        semantic_enabled,
-        max_results,
-    );
-
-    indexer.query_in_flight.store(false, Ordering::SeqCst);
+    let results = crate::util::pools::query_pool().install(|| {
+        SearchDispatcher::search(
+            &query,
+            &metadata,
+            &content_index,
+            Some(&unit_store),
+            semantic_enabled,
+            max_results,
+        )
+    });
+    drop(_in_flight);
     record_query_latency(started.elapsed().as_micros() as u64);
     Ok(results)
 }
@@ -491,30 +506,8 @@ pub async fn set_theme(
     config.save()?;
     *state.indexer.config.write() = config;
 
-    // On Windows, swap the tray icon to match the new theme so it remains
-    // visible on both light and dark taskbars.  A tray failure is logged but
-    // never returned as an error: a failed icon swap must never block saving
-    // the theme.
-    #[cfg(windows)]
-    {
-        if let Some(tray) = app.tray_by_id("main") {
-            let icon_bytes = crate::tray_icon::tray_icon_bytes(&normalized);
-            match crate::tray_icon::decode_png(icon_bytes)
-                .or_else(|| app.default_window_icon().cloned())
-            {
-                Some(icon) => {
-                    if let Err(e) = tray.set_icon(Some(icon)) {
-                        eprintln!("[Babbage] tray icon update failed: {e}");
-                    }
-                }
-                None => {
-                    eprintln!("[Babbage] tray icon: could not decode PNG for theme '{normalized}'")
-                }
-            }
-        }
-    }
-    // Suppress unused-variable warning on non-Windows targets.
-    #[cfg(not(windows))]
+    // The tray watcher in `lib.rs` picks up the new theme on its next tick.
+    // `app` stays in the signature so the frontend call is unchanged.
     let _ = app;
 
     Ok(())
@@ -556,15 +549,37 @@ pub struct FilePreview {
 }
 
 #[tauri::command]
-pub async fn get_file_preview(path: String) -> Result<FilePreview, String> {
+pub async fn get_file_preview(
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<FilePreview, String> {
+    let indexer = std::sync::Arc::clone(&state.indexer);
     // Metadata, image decoding and document extraction are all blocking work;
     // keep them off the async runtime.
-    tauri::async_runtime::spawn_blocking(move || build_file_preview(&path))
+    tauri::async_runtime::spawn_blocking(move || {
+        // Already-indexed text comes from the content index, so opening a
+        // preview of a PDF or scanned document no longer re-runs the parser
+        // or OCR (and no longer competes with the crawl for a slot).
+        let stored = indexer
+            .content_index
+            .read()
+            .as_ref()
+            .and_then(|index| index.get_stored_text(Path::new(&path)));
+        build_file_preview_with(&path, stored)
+    })
         .await
         .map_err(|e| format!("Preview task failed: {}", e))?
 }
 
+#[cfg(test)]
 fn build_file_preview(path: &str) -> Result<FilePreview, String> {
+    build_file_preview_with(path, None)
+}
+
+/// Longest preview text, in bytes.
+const PREVIEW_MAX_BYTES: usize = 128_000;
+
+fn build_file_preview_with(path: &str, stored_text: Option<String>) -> Result<FilePreview, String> {
     let p = Path::new(path);
     if !p.exists() {
         return Err("File does not exist".to_string());
@@ -630,7 +645,25 @@ fn build_file_preview(path: &str) -> Result<FilePreview, String> {
         });
     }
 
-    if let Some(doc) = crate::indexer::extract::extract_document(p, 128_000) {
+    let stored = stored_text.filter(|text| !text.trim().is_empty()).map(|mut text| {
+        if text.len() > PREVIEW_MAX_BYTES {
+            let mut cut = PREVIEW_MAX_BYTES;
+            while !text.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            text.truncate(cut);
+        }
+        crate::indexer::extract::DocumentExtract {
+            text,
+            page_count: None,
+            is_encrypted: false,
+            is_scanned: false,
+            format_name: String::new(),
+        }
+    });
+    if let Some(doc) = stored
+        .or_else(|| crate::indexer::extract::extract_document(p, PREVIEW_MAX_BYTES as u64))
+    {
         let preview_type = match crate::indexer::extract::sniff_format(p) {
             crate::indexer::extract::DocumentFormat::Pdf => "pdf",
             crate::indexer::extract::DocumentFormat::Docx => "doc",

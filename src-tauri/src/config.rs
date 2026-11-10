@@ -137,7 +137,7 @@ pub struct BabbageConfig {
     pub mcp_allow_reindex: bool,
     #[serde(default = "default_true")]
     pub ocr_enabled: bool,
-    /// How the app presents itself: `launcher` (hide on blur/Esc, tray only,
+    /// How the app presents itself: `launcher` (hide on Esc, tray only,
     /// tiny footprint) or `app` (stays open, appears in the dock/taskbar).
     #[serde(default = "default_app_mode")]
     pub app_mode: String,

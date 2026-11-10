@@ -158,7 +158,9 @@ fn create(app: &AppHandle) -> tauri::Result<WebviewWindow> {
         .min_inner_size(720.0, 520.0)
         .decorations(!launcher)
         .transparent(launcher)
-        .always_on_top(launcher)
+        // Never pinned above other windows, in either mode: a floating
+        // palette that covers everything else was more annoying than useful.
+        .always_on_top(false)
         .skip_taskbar(launcher)
         .visible_on_all_workspaces(launcher)
         .center()
@@ -212,7 +214,7 @@ pub fn apply_mode(window: &WebviewWindow, app_mode: &str) {
     let launcher = app_mode != "app" && setup_complete;
     let _ = window.set_decorations(!launcher);
     let _ = window.set_skip_taskbar(launcher);
-    let _ = window.set_always_on_top(launcher);
+    let _ = window.set_always_on_top(false);
     let _ = window.set_visible_on_all_workspaces(launcher);
 }
 
@@ -272,7 +274,7 @@ pub fn hide(app: &AppHandle) {
     // destroyed, keeping tens to hundreds of MB resident. Kill them and trim
     // the allocator so the hidden app keeps only the Rust side.
     crate::util::memory::kill_webview_processes();
-    crate::util::memory::release_memory();
+    crate::util::memory::trim_working_set();
 }
 
 /// Shows the window if it is hidden, hides it if it is shown.

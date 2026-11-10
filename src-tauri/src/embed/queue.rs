@@ -18,7 +18,7 @@ pub struct EmbeddingQueue {
     pub model: std::sync::Arc<ModelRegistry>,
     pub unit_store: Arc<RwLock<UnitStore>>,
     pub is_running: Arc<AtomicBool>,
-    pub query_in_flight: Arc<AtomicBool>,
+    pub query_in_flight: Arc<crate::util::pools::QueryFlag>,
     pub status: Option<Arc<RwLock<IndexingStatus>>>,
     pub app_handle: Option<Arc<RwLock<Option<tauri::AppHandle>>>>,
     worker_handle: Option<JoinHandle<()>>,
@@ -35,7 +35,7 @@ impl EmbeddingQueue {
             model,
             unit_store,
             is_running: Arc::new(AtomicBool::new(false)),
-            query_in_flight: Arc::new(AtomicBool::new(false)),
+            query_in_flight: Arc::new(crate::util::pools::QueryFlag::new()),
             status,
             app_handle,
             worker_handle: None,
@@ -81,6 +81,7 @@ impl EmbeddingQueue {
 
                 let mut hash_cache: HashMap<String, CachedChunks> = HashMap::new();
                 let mut was_embedding = false;
+                let mut idle_polls: u32 = 0;
 
                 while is_running.load(Ordering::SeqCst) {
                     // Preempt if query in flight
@@ -121,11 +122,19 @@ impl EmbeddingQueue {
                             }
                             Self::emit_status(&app_handle, &status);
                         }
-                        // Idle poll interval. Kept short so a crawl that stops
-                        // this worker does not sit in `join` for a full second.
-                        thread::sleep(Duration::from_millis(200));
+                        // Idle poll with backoff: 200 ms right after work, up
+                        // to 2 s once the queue has stayed empty, slept in
+                        // 100 ms slices so a stop request is still seen fast.
+                        idle_polls = idle_polls.saturating_add(1);
+                        let idle_ms = (200u64 * u64::from(idle_polls)).min(2_000);
+                        let mut slept = 0;
+                        while slept < idle_ms && is_running.load(Ordering::SeqCst) {
+                            thread::sleep(Duration::from_millis(100));
+                            slept += 100;
+                        }
                         continue;
                     }
+                    idle_polls = 0;
 
                     if !was_embedding {
                         was_embedding = true;

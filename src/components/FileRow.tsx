@@ -48,6 +48,11 @@ export const FileRow = React.memo(function FileRow({
       title={item.path}
       onClick={onSelect}
       onDoubleClick={onOpen}
+      // Hover selects so Space previews the hovered row; mousemove (not
+      // mouseenter) so keyboard scrolling doesn't steal the selection.
+      onMouseMove={() => {
+        if (!selected) onSelect();
+      }}
       onContextMenu={(e) => {
         if (!onContextMenu) return;
         e.preventDefault();
