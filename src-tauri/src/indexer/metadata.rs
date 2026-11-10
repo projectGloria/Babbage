@@ -722,108 +722,87 @@ impl MetadataStore {
         }
     }
 
+    /// Nodes under `old` (index, old path, new path) and nodes already under
+    /// `new` that the rename will replace.
+    #[allow(clippy::type_complexity)] // a private, single-use tuple pair
+    fn scan_rename(&self, old: &Path, new: &Path) -> (Vec<(u32, PathBuf, PathBuf)>, Vec<PathBuf>) {
+        let mut moved = Vec::new();
+        let mut conflicts = Vec::new();
+        for i in 0..self.arena.len() {
+            let idx = i as u32;
+            let p = self.arena.path(idx);
+            if let Ok(suffix) = p.strip_prefix(old) {
+                let new_path = if suffix.as_os_str().is_empty() {
+                    new.to_path_buf()
+                } else {
+                    new.join(suffix)
+                };
+                moved.push((idx, p, new_path));
+            } else if p.starts_with(new) {
+                conflicts.push(p);
+            }
+        }
+        (moved, conflicts)
+    }
+
     pub fn rename_prefix(&mut self, old: &Path, new: &Path) -> Vec<PathBuf> {
         if old.as_os_str().is_empty() || old == new {
             return Vec::new();
         }
 
-        // conflicts
-        let mut conflicts: Vec<PathBuf> = Vec::new();
-        for i in 0..self.arena.len() {
-            let idx = i as u32;
-            let p = self.arena.path(idx);
-            if !p.starts_with(old) && p.starts_with(new) {
-                conflicts.push(p);
+        // One pass over the arena, materializing each path once (this runs
+        // under the metadata write lock, so every pass blocks searches).
+        // Paths are derived from the parent chain, so everything is captured
+        // before any node changes.
+        let (mut moved, conflicts) = self.scan_rename(old, new);
+        if !conflicts.is_empty() {
+            for path in conflicts {
+                self.remove(&path);
             }
+            // `remove` swap-removes nodes, so indices captured above are
+            // stale; rescan (rare: only when the target already existed).
+            moved = self.scan_rename(old, new).0;
         }
-        for path in conflicts {
-            self.remove(&path);
+        if moved.is_empty() {
+            return Vec::new();
         }
 
-        let mut old_paths = Vec::new();
-        // Reparent the renamed root (if present) under the new location's ancestors.
-        for i in 0..self.arena.len() {
-            let idx = i as u32;
-            let p = self.arena.path(idx);
-            if p == old {
-                let new_parent = self.parent_index_for(new);
-                if new_parent == NO_PARENT {
-                    let full = new.to_string_lossy().into_owned();
-                    let (off, len) = self.arena.names.push(&full);
-                    let node = self.arena.node_mut(idx);
-                    node.parent = new_parent;
-                    node.name_off = off;
-                    node.name_len = len;
-                } else {
-                    let node = self.arena.node_mut(idx);
-                    node.parent = new_parent;
-                }
-            }
+        // Drop the old keys while the arena still resolves them.
+        for (_, old_path, _) in &moved {
+            self.path_index.remove(&self.arena, old_path);
         }
-        // Snapshot the subtree before changing any name.
-        //
-        // `arena.path()` is reconstructed from the parent chain, so rewriting
-        // an ancestor's name changed every descendant's derived path. The
-        // single-pass version below that mutated as it scanned therefore
-        // matched the renamed root and then failed `strip_prefix(old)` for
-        // every child: only the root reached `old_paths`, it has no document
-        // of its own, and every `old/**` document stayed in the content index
-        // forever under a path that no longer exists.
-        let mut moved: Vec<(u32, PathBuf, PathBuf)> = Vec::new();
-        for i in 0..self.arena.len() {
-            let idx = i as u32;
-            let p = self.arena.path(idx);
-            let Ok(suffix) = p.strip_prefix(old) else {
+
+        // Only the renamed root changes: descendants keep their own names and
+        // follow it through their parent pointers.
+        for (idx, old_path, _) in &moved {
+            if old_path.as_path() != old {
                 continue;
-            };
-            let new_path = if suffix.as_os_str().is_empty() {
-                new.to_path_buf()
+            }
+            let new_parent = self.parent_index_for(new);
+            let new_name = if new_parent == NO_PARENT {
+                // A root node stores its full path as its name.
+                new.to_string_lossy().into_owned()
             } else {
-                new.join(suffix)
+                new.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default()
             };
-            moved.push((idx, p, new_path));
-        }
-
-        for (idx, old_path, new_path) in moved {
-            old_paths.push(old_path);
-            // update name (file_name) and char_bloom
-            let new_name = new_path
+            let bloom_name = new
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
+                .unwrap_or_else(|| new_name.clone());
             let (name_off, name_len) = self.arena.names.push(&new_name);
-            let node = self.arena.node_mut(idx);
+            let node = self.arena.node_mut(*idx);
+            node.parent = new_parent;
             node.name_off = name_off;
             node.name_len = name_len;
-            node.char_bloom = crate::search::fuzzy::compute_char_mask(&new_name);
-            // store new path? We don't store full path; path derived from parent chain.
-            // Parent chain unchanged (directory renamed would require updating parents).
-            // For correctness, update parent pointers? Complex. Instead, rebuild path_index after.
+            node.char_bloom = crate::search::fuzzy::compute_char_mask(&bloom_name);
         }
 
-        if old_paths.is_empty() {
-            return old_paths;
-        }
-
-        // Rebuild path_index
-        self.path_index.clear();
-        for i in 0..self.arena.len() {
-            let idx = i as u32;
-            let p = self.arena.path(idx);
-            // Wait: path() derives from parent chain + names. If we only updated leaf names,
-            // parent directories names not updated for rename_prefix of a directory.
-            // This is a known limitation; rename_prefix in original updated path strings.
-            // To handle directory renames properly, we'd need update all descendants' parent names?
-            // Our arena stores names per node; renaming a directory means renaming that node's name,
-            // and descendants keep parent pointers, so path() will reflect new dir name. Good.
-            // But we updated only nodes whose path starts with old? We updated names for those nodes
-            // based on new_path.file_name(), which for a child keeps its own name, not parent. Oops.
-            // Actually for a directory rename, the directory node's name should change to new's last component;
-            // descendants keep their names. Our loop changed EVERY descendant's name to its new_path last component,
-            // which is wrong (child name becomes same as? new_path for child is new/child, file_name=child, okay).
-            // For the renamed root itself, new_path=new, file_name=new last comp. Good.
-            // So names are okay.
-            self.insert_path_index(&p, idx);
+        let mut old_paths = Vec::with_capacity(moved.len());
+        for (idx, old_path, new_path) in moved {
+            self.insert_path_index(&new_path, idx);
+            old_paths.push(old_path);
         }
 
         self.generation.fetch_add(1, Ordering::SeqCst);
@@ -1213,6 +1192,32 @@ mod tests {
             all.push(dir);
         }
         all
+    }
+
+    #[test]
+    fn rename_prefix_moves_subtree_and_replaces_conflicts() {
+        let mut t = TempStore::new("rename-prefix");
+        let root = t.dir.join("root");
+        tree(t.store(), &root, 3, 4);
+        // An existing target path that the rename must replace.
+        let target = root.join("renamed");
+        t.store().add(entry(&target, true));
+        t.store().add(entry(&target.join("stale.txt"), false));
+
+        let old = root.join("d1");
+        let moved = t.store().rename_prefix(&old, &target);
+        assert_eq!(moved.len(), 5, "directory plus its four files");
+
+        let store = t.store();
+        assert!(store.get(&old).is_none());
+        assert!(store.get(&old.join("f0.txt")).is_none());
+        assert!(store.get(&target.join("stale.txt")).is_none());
+        let file = store.get(&target.join("f3.txt")).expect("moved file");
+        assert_eq!(file.name, "f3.txt");
+        assert_eq!(store.get(&target).expect("moved dir").name, "renamed");
+        // Untouched siblings keep resolving.
+        assert!(store.get(&root.join("d0").join("f0.txt")).is_some());
+        assert!(store.get(&root.join("d2").join("f2.txt")).is_some());
     }
 
     #[test]

@@ -1788,8 +1788,25 @@ impl IndexerManager {
         offset: usize,
         with_snippets: bool,
     ) -> Result<SearchResponse, String> {
-        let config = self.config.read();
-        let aliases = config.alias_pairs();
+        self.search_page_sorted(query, limit, offset, with_snippets, SortOrder::Best)
+    }
+
+    /// [`Self::search_page`] with an explicit result order (the GUI's sort
+    /// control, forwarded through the daemon).
+    pub fn search_page_sorted(
+        &self,
+        query: &str,
+        limit: usize,
+        offset: usize,
+        with_snippets: bool,
+        sort: SortOrder,
+    ) -> Result<SearchResponse, String> {
+        // Copy what the search needs out of the config so a settings save is
+        // never blocked behind a long query.
+        let (aliases, semantic_enabled) = {
+            let config = self.config.read();
+            (config.alias_pairs(), config.semantic_enabled)
+        };
         let metadata = self.metadata.read();
         let content = self.content_index.read();
         let units = self.unit_store.read();
@@ -1801,10 +1818,10 @@ impl IndexerManager {
                 &content,
                 Some(&units),
                 Some(&visual),
-                config.semantic_enabled,
+                semantic_enabled,
                 limit,
                 0,
-                SortOrder::Best,
+                sort,
                 &aliases,
                 offset,
                 with_snippets,

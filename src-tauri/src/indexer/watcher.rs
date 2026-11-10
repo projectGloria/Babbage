@@ -648,15 +648,7 @@ fn handle_directory_rename(
 ) {
     let old_paths = metadata.write().rename_prefix(old_path, new_path);
 
-    // The old path terms no longer match anything; the repair walk re-adds
-    // fresh documents under the new paths.
-    if let Some(c_index) = content_index.read().as_ref() {
-        for path in &old_paths {
-            let _ = c_index.remove(path);
-        }
-        let _ = c_index.commit();
-    }
-
+    let old_root = old_path.to_path_buf();
     let new_dir = new_path.to_path_buf();
     let excluded_dirs = cfg.excluded_dirs.clone();
     let include_ignored = cfg.include_ignored;
@@ -666,6 +658,38 @@ fn handle_directory_rename(
     // A large directory move can take a while; re-index it off the watcher
     // thread so event draining is not blocked.
     thread::spawn(move || {
+        // Move each document to its new path using the text already stored
+        // in the index. File identity is not the path, so a rename must not
+        // re-run extraction (OCR, PDF parsing) for content we already have.
+        let mut moved: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        if let Some(c_index) = content_index.read().as_ref() {
+            for old in &old_paths {
+                let Ok(rel) = old.strip_prefix(&old_root) else {
+                    let _ = c_index.remove(old);
+                    continue;
+                };
+                let new = new_dir.join(rel);
+                if let Some(text) = c_index.get_stored_text(old) {
+                    let entry = metadata.read().get(&new);
+                    if let Some(entry) = entry {
+                        let _ = c_index.add_or_update(
+                            &new,
+                            &entry.name,
+                            &text,
+                            entry.modified,
+                            entry.size,
+                            entry.extension,
+                        );
+                        moved.insert(new);
+                    }
+                }
+                let _ = c_index.remove(old);
+            }
+            let _ = c_index.commit();
+        }
+
+        // Repair walk: picks up entries the index did not know about (new
+        // files moved in, or documents stored without their text).
         let entries = walk_directories(
             std::slice::from_ref(&new_dir),
             &excluded_dirs,
@@ -674,6 +698,9 @@ fn handle_directory_rename(
         let mut pending_commits = 0usize;
 
         for entry in entries {
+            if moved.contains(&entry.path) {
+                continue;
+            }
             let is_indexable = !entry.is_dir
                 && (is_indexable_extension(entry.extension)
                     || is_indexable_file_name(&entry.name)

@@ -7,8 +7,8 @@
 //! - **Loopback only.** The listener binds `127.0.0.1` and rejects any peer
 //!   that is not a loopback address.
 //! - **Token auth.** Every request needs `Authorization: Bearer <token>`;
-//!   the token lives in `<config>/http.token` (0600) and is printed to
-//!   stderr once at startup.
+//!   the token lives in `<config>/http.token` (0600). Startup prints the
+//!   file's path, never the token itself, so it cannot leak into logs.
 //! - **Read-only.** `reindex` is never enabled on this transport regardless
 //!   of config.
 //!
@@ -97,12 +97,26 @@ pub fn ensure_token(config_dir: &Path) -> Result<String, String> {
         }
     }
     let token = super::new_connection_token();
-    std::fs::write(&path, &token).map_err(|e| format!("write {}: {}", path.display(), e))?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    // Create the file owner-only from the start: writing first and then
+    // narrowing the mode left a window where other users could read it.
     #[cfg(unix)]
     {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&path)
+        .map_err(|e| format!("write {}: {}", path.display(), e))?;
+    #[cfg(unix)]
+    {
+        // An existing (empty) file keeps its old mode; narrow it too.
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
     }
+    file.write_all(token.as_bytes())
+        .map_err(|e| format!("write {}: {}", path.display(), e))?;
     Ok(token)
 }
 
@@ -165,12 +179,12 @@ fn serve_with_session(
     session: Option<AgentSessionState>,
 ) -> Result<(), HttpError> {
     eprintln!(
-        "[Babbage HTTP] listening on http://{} (token: {})",
+        "[Babbage HTTP] listening on http://{} (bearer token in <config>/http.token)",
         listener
             .local_addr()
             .map_err(|e| HttpError::Io(e.to_string()))?,
-        token
     );
+    // The token is deliberately not printed: stderr ends up in logs.
 
     let state = Arc::new(HttpState {
         session: Mutex::new(session),
@@ -271,9 +285,31 @@ struct Request {
 
 /// Reads one HTTP/1.x request (headers + bounded body). Returns `None` on
 /// parse failure, EOF, or an oversized/malformed request.
+/// Longest request line or header line accepted. `read_line` alone buffers
+/// until it sees a newline, so one endless line could exhaust memory.
+const MAX_LINE_BYTES: u64 = 8 * 1024;
+
+/// Reads one line of at most [`MAX_LINE_BYTES`]. `None` on I/O error or an
+/// over-long line; `Some(0)` on EOF.
+fn read_bounded_line(reader: &mut BufReader<TcpStream>, line: &mut String) -> Option<usize> {
+    let read = reader.by_ref().take(MAX_LINE_BYTES).read_line(line).ok()?;
+    if read as u64 == MAX_LINE_BYTES && !line.ends_with('\n') {
+        return None;
+    }
+    Some(read)
+}
+
+/// Compares two secrets without exiting early on the first differing byte.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 fn read_request(reader: &mut BufReader<TcpStream>) -> Option<Request> {
     let mut request_line = String::new();
-    if reader.read_line(&mut request_line).ok()? == 0 {
+    if read_bounded_line(reader, &mut request_line)? == 0 {
         return None;
     }
     let mut parts = request_line.split_whitespace();
@@ -290,7 +326,7 @@ fn read_request(reader: &mut BufReader<TcpStream>) -> Option<Request> {
     let mut header_lines = 0usize;
     loop {
         let mut line = String::new();
-        let read = reader.read_line(&mut line).ok()?;
+        let read = read_bounded_line(reader, &mut line)?;
         if read == 0 {
             return None;
         }
@@ -356,7 +392,11 @@ struct HttpResponse {
 
 fn route_request(request: &Request, state: &HttpState) -> Route {
     // Auth first: everything requires the bearer token.
-    if request.token.as_deref() != Some(state.token.as_str()) {
+    let authorized = request
+        .token
+        .as_deref()
+        .is_some_and(|token| constant_time_eq(token.as_bytes(), state.token.as_bytes()));
+    if !authorized {
         return Route::Body(json_response(
             401,
             "Unauthorized",

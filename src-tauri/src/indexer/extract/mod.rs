@@ -286,7 +286,7 @@ pub fn insert_cached_document(path: &Path, document: DocumentExtract) {
     let Some(key) = cache_key(path) else {
         return;
     };
-    let mut cache = get_extraction_cache().lock().unwrap();
+    let mut cache = get_extraction_cache().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     cache.insert(key, document);
 }
 
@@ -418,7 +418,7 @@ static TIMEOUT_WARNED: std::sync::OnceLock<Mutex<HashSet<PathBuf>>> = std::sync:
 
 fn warn_extraction_timeout(path: &Path, timeout: Duration) {
     let warned = TIMEOUT_WARNED.get_or_init(|| Mutex::new(HashSet::new()));
-    let mut warned = warned.lock().unwrap();
+    let mut warned = warned.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     // Keep the bookkeeping bounded on systems with many broken documents.
     if warned.len() >= 4096 {
         warned.clear();
@@ -441,7 +441,7 @@ fn warn_external_failure(path: &Path, error: &str) {
     static WARNED: std::sync::OnceLock<Mutex<HashSet<PathBuf>>> = std::sync::OnceLock::new();
     static COUNT: AtomicUsize = AtomicUsize::new(0);
     let warned = WARNED.get_or_init(|| Mutex::new(HashSet::new()));
-    let mut warned = warned.lock().unwrap();
+    let mut warned = warned.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if warned.len() >= 4096 {
         warned.clear();
     }
@@ -517,7 +517,7 @@ fn extract_document_tracked(
     // Check cache first
     let cache_key = (path.to_path_buf(), file_size, mtime);
     {
-        let mut cache = get_extraction_cache().lock().unwrap();
+        let mut cache = get_extraction_cache().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(cached) = cache.get(&cache_key) {
             return Some(cached);
         }
@@ -628,7 +628,7 @@ fn extract_document_tracked(
         && res.text.len() <= 256 * 1024
         && !retry.load(Ordering::SeqCst)
     {
-        let mut cache = get_extraction_cache().lock().unwrap();
+        let mut cache = get_extraction_cache().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         cache.insert(cache_key, res.clone());
     }
 

@@ -143,7 +143,7 @@ fn status_slot() -> &'static Mutex<UpdateStatus> {
 }
 
 pub fn get_status() -> UpdateStatus {
-    status_slot().lock().unwrap().clone()
+    status_slot().lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
 }
 
 /// Every network call the updater makes is bounded. Without a timeout a
@@ -274,7 +274,7 @@ fn download_update_internal(asset_url: &str, asset_name: &str) -> Result<UpdateS
     let update_dir = std::env::temp_dir().join("babbage-updates");
     if let Err(e) = std::fs::create_dir_all(&update_dir) {
         DOWNLOADING.store(false, Ordering::SeqCst);
-        let mut s = status_slot().lock().unwrap();
+        let mut s = status_slot().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         s.busy = false;
         s.error = Some(format!("Could not create update directory: {e}"));
         return Ok(s.clone());
@@ -285,7 +285,7 @@ fn download_update_internal(asset_url: &str, asset_name: &str) -> Result<UpdateS
 
     // Reset status
     {
-        let mut s = status_slot().lock().unwrap();
+        let mut s = status_slot().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         s.busy = true;
         s.error = None;
         s.ready_to_install = false;
@@ -339,7 +339,7 @@ fn download_update_internal(asset_url: &str, asset_name: &str) -> Result<UpdateS
                         0
                     };
 
-                    let mut s = status_slot().lock().unwrap();
+                    let mut s = status_slot().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     s.progress = Some(UpdateProgress {
                         phase: "downloading".to_string(),
                         downloaded,
@@ -379,7 +379,7 @@ fn download_update_internal(asset_url: &str, asset_name: &str) -> Result<UpdateS
                 Ok(())
             })();
 
-            let mut s = status_slot().lock().unwrap();
+            let mut s = status_slot().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             s.busy = false;
             DOWNLOADING.store(false, Ordering::SeqCst);
             match res {
@@ -407,7 +407,7 @@ fn download_update_internal(asset_url: &str, asset_name: &str) -> Result<UpdateS
 /// Spawns the installer detached and exits Babbage so files are replaced cleanly.
 pub fn install_and_restart(app: &AppHandle) -> Result<(), String> {
     let path_str = {
-        let s = status_slot().lock().unwrap();
+        let s = status_slot().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         s.downloaded_path.clone().ok_or_else(|| "No update has been downloaded yet".to_string())?
     };
 

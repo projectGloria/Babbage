@@ -372,8 +372,13 @@ fn handle_client(stream: LocalSocketStream, token: &str, manager: &Arc<IndexerMa
                         .search_page_after(query, limit, start_after, with_snippets)
                         .and_then(|r| serde_json::to_value(r).map_err(|e| e.to_string()))
                 } else {
+                    let sort = params
+                        .get("sort")
+                        .and_then(Value::as_str)
+                        .map(babbage_lib::search::SortOrder::parse)
+                        .unwrap_or_default();
                     manager
-                        .search_page(query, limit, offset, with_snippets)
+                        .search_page_sorted(query, limit, offset, with_snippets, sort)
                         .and_then(|r| serde_json::to_value(r).map_err(|e| e.to_string()))
                 }
             }

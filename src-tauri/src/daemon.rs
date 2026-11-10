@@ -180,6 +180,28 @@ impl DaemonClient {
         serde_json::from_value(value).map_err(|e| e.to_string())
     }
 
+    /// GUI search page: never computes snippets (the UI fetches them for
+    /// visible rows only) and forwards the sort order.
+    pub fn search_page_sorted(
+        &self,
+        query: String,
+        limit: usize,
+        offset: usize,
+        sort: Option<&str>,
+    ) -> Result<crate::search::SearchResponse, String> {
+        let value = request(
+            "search",
+            serde_json::json!({
+                "query": query,
+                "limit": limit,
+                "offset": offset,
+                "snippets": false,
+                "sort": sort,
+            }),
+        )?;
+        serde_json::from_value(value).map_err(|e| e.to_string())
+    }
+
     /// Keyset-paginated exhaustive search past the 10k cap (agent surfaces).
     pub fn search_page_after(
         &self,

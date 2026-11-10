@@ -105,6 +105,8 @@ export interface SearchResponse {
   total?: number;
   /** "ranked" or "exhaustive". */
   mode?: string;
+  /** Superseded by a newer search before it ran; carries no results. */
+  cancelled?: boolean;
 }
 
 export interface FilePreview {

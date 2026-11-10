@@ -256,7 +256,7 @@ babbage-cli connect claude-desktop --write   # or claude-code / cursor
 babbage-cli connect cursor                   # prints the JSON snippet instead
 
 # Loopback HTTP/SSE transport for MCP clients (bearer token in
-# <config>/http.token; printed once on startup):
+# <config>/http.token; startup prints its path):
 babbage-cli serve --port 8765
 ```
 

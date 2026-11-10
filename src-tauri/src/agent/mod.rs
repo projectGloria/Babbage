@@ -740,13 +740,55 @@ fn lexical_scope_path(path: &str) -> PathBuf {
 /// symlinks and `..` resolve exactly as the OS would; non-existent paths use a
 /// lexical normalization (enough to stop `..` escapes).
 fn resolved_scope_path(path: &str) -> PathBuf {
-    let expanded = expand_tilde(path);
-    std::fs::canonicalize(&expanded).unwrap_or_else(|_| lexical_scope_path(&expanded))
+    let lexical = lexical_scope_path(&expand_tilde(path));
+    // Canonicalize the deepest ancestor that exists and re-append the rest,
+    // so a not-yet-existing subpath resolves the same way as its existing
+    // root (mixing canonical and lexical forms made containment fail).
+    let mut existing = lexical.as_path();
+    let mut rest: Vec<&std::ffi::OsStr> = Vec::new();
+    loop {
+        if let Ok(canonical) = std::fs::canonicalize(existing) {
+            let mut out = strip_verbatim(canonical);
+            for part in rest.iter().rev() {
+                out.push(part);
+            }
+            return out;
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name);
+                existing = parent;
+            }
+            _ => return lexical,
+        }
+    }
+}
+
+/// Windows `canonicalize` returns verbatim (`\\?\C:\...`) paths; drop the
+/// prefix so they compare against ordinary spellings. No-op elsewhere.
+fn strip_verbatim(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let text = path.to_string_lossy();
+        if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = text.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest);
+        }
+    }
+    path
 }
 
 fn scope_contains(root: &str, path: &str) -> bool {
     let root = resolved_scope_path(root);
     let path = resolved_scope_path(path);
+    // NTFS paths are case-insensitive; compare that way on Windows.
+    #[cfg(windows)]
+    let (root, path) = (
+        PathBuf::from(root.to_string_lossy().to_lowercase()),
+        PathBuf::from(path.to_string_lossy().to_lowercase()),
+    );
     path == root || path.starts_with(&root)
 }
 
@@ -1041,6 +1083,15 @@ mod scope_tests {
             agent_scope_paths(&roots, Some(&root.join("sub").to_string_lossy())).unwrap(),
             vec![root.join("sub").to_string_lossy().into_owned()]
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_scope_ignores_case_and_missing_subpaths() {
+        let root = temp_root("wincase");
+        let roots = vec![root.to_string_lossy().into_owned()];
+        let upper = root.join("Not Yet").join("x.txt").to_string_lossy().to_uppercase();
+        assert!(agent_path_allowed(&roots, &upper));
     }
 
     #[test]

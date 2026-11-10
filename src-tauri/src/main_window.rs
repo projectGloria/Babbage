@@ -90,10 +90,12 @@ pub fn record_recent_query(query: &str) {
         Err(poisoned) => poisoned.into_inner(),
     };
     let trimmed_lower = trimmed.to_lowercase();
-    // Case-insensitive deduplication and supersede exact prefix extensions
+    // Case-insensitive deduplication. A new query that extends an older one
+    // ("invo" -> "invoice") supersedes it: the older entry was a step along
+    // the way, not a search worth offering again.
     list.retain(|q| {
         let q_lower = q.to_lowercase();
-        q_lower != trimmed_lower && !trimmed_lower.starts_with(&format!("{q_lower} "))
+        q_lower != trimmed_lower && !trimmed_lower.starts_with(q_lower.as_str())
     });
     list.push_front(trimmed.to_string());
     if list.len() > 5 {
@@ -374,6 +376,15 @@ mod tests {
         // Prefix extension superseding
         record_recent_query("Alpha project");
         assert_eq!(recent_queries(), vec!["Alpha project", "gamma", "beta"]);
+
+        // Typing prefixes collapse into the final query
+        record_recent_query("inv");
+        record_recent_query("invo");
+        record_recent_query("invoice");
+        assert_eq!(recent_queries(), vec!["invoice", "Alpha project", "gamma", "beta"]);
+        clear_recent_queries();
+        record_recent_query("gamma");
+        record_recent_query("Alpha project");
 
         // Cap at 5
         record_recent_query("delta");

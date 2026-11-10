@@ -173,16 +173,34 @@ pub async fn search(
 ) -> Result<SearchResponse, String> {
     let started = Instant::now();
     let _searching = crate::tray_icon::SearchGuard::start();
-    let req_seq = seq.unwrap_or_else(|| CURRENT_SEARCH_SEQ.fetch_add(1, Ordering::SeqCst) + 1);
-    CURRENT_SEARCH_SEQ.store(req_seq, Ordering::SeqCst);
+    // Only a fresh search (no offset) supersedes earlier ones. A load-more
+    // page belongs to the search already on screen and must neither cancel
+    // a newer search nor be cancelled by one.
+    let is_page = offset.unwrap_or(0) > 0;
+    let req_seq = if is_page {
+        seq.unwrap_or_else(|| CURRENT_SEARCH_SEQ.load(Ordering::SeqCst))
+    } else {
+        match seq {
+            // `fetch_max`: a late-arriving older request must never roll the
+            // counter back, or the newest search would see itself as stale.
+            Some(seq) => {
+                CURRENT_SEARCH_SEQ.fetch_max(seq, Ordering::SeqCst);
+                seq
+            }
+            None => CURRENT_SEARCH_SEQ.fetch_add(1, Ordering::SeqCst) + 1,
+        }
+    };
 
     if let Some(daemon) = state.daemon.as_ref() {
-        let mut resp = daemon.search_page(
-            query.clone(),
-            state.indexer.config.read().max_results,
-            offset.unwrap_or(0),
-            false,
-        )?;
+        let daemon = *daemon;
+        let limit = state.indexer.config.read().max_results;
+        let offset = offset.unwrap_or(0);
+        // The daemon call is a blocking socket round-trip.
+        let mut resp = tauri::async_runtime::spawn_blocking(move || {
+            daemon.search_page_sorted(query, limit, offset, sort.as_deref())
+        })
+        .await
+        .map_err(|e| format!("Search task failed: {}", e))??;
         resp.seq = req_seq;
         record_query_latency(started.elapsed().as_micros() as u64);
         return Ok(resp);
@@ -205,9 +223,10 @@ pub async fn search(
     let resp = tauri::async_runtime::spawn_blocking(move || {
         // A newer keystroke already arrived: skip the work entirely. The
         // frontend discards stale responses by `seq` anyway.
-        if CURRENT_SEARCH_SEQ.load(Ordering::SeqCst) != req_seq {
+        if !is_page && CURRENT_SEARCH_SEQ.load(Ordering::SeqCst) > req_seq {
             return SearchResponse {
                 seq: req_seq,
+                cancelled: true,
                 ..SearchResponse::default()
             };
         }
@@ -274,12 +293,27 @@ pub async fn get_snippets(
     state: State<'_, AppState>,
 ) -> Result<Vec<SnippetDto>, String> {
     if let Some(daemon) = state.daemon.as_ref() {
-        return daemon.get_snippets(paths, &query);
+        let daemon = *daemon;
+        return tauri::async_runtime::spawn_blocking(move || daemon.get_snippets(paths, &query))
+            .await
+            .map_err(|e| format!("Snippet task failed: {}", e))?;
     }
+    // Only paths the index knows about may be read: the webview cannot use
+    // this to read arbitrary files, and denied paths never reach disk.
+    let indexer = std::sync::Arc::clone(&state.indexer);
     // File reads stay off the async runtime even though they are cheap.
-    tauri::async_runtime::spawn_blocking(move || compute_snippets(paths, &query))
-        .await
-        .map_err(|e| format!("Snippet task failed: {}", e))
+    tauri::async_runtime::spawn_blocking(move || {
+        let paths: Vec<String> = {
+            let metadata = indexer.metadata.read();
+            paths
+                .into_iter()
+                .filter(|p| metadata.get(Path::new(p)).is_some())
+                .collect()
+        };
+        compute_snippets(paths, &query)
+    })
+    .await
+    .map_err(|e| format!("Snippet task failed: {}", e))
 }
 
 pub fn compute_snippets(paths: Vec<String>, query: &str) -> Vec<SnippetDto> {
@@ -306,40 +340,45 @@ pub async fn legacy_search(
 ) -> Result<Vec<SearchResult>, String> {
     let started = Instant::now();
     if let Some(daemon) = state.daemon.as_ref() {
-        let resp = daemon.search_page(
-            query.clone(),
-            state.indexer.config.read().max_results,
-            0,
-            false,
-        )?;
+        let daemon = *daemon;
+        let limit = state.indexer.config.read().max_results;
+        let resp = tauri::async_runtime::spawn_blocking(move || {
+            daemon.search_page(query, limit, 0, false)
+        })
+        .await
+        .map_err(|e| format!("Search task failed: {}", e))??;
         record_query_latency(started.elapsed().as_micros() as u64);
         return Ok(resp.results);
     }
 
-    let indexer = &state.indexer;
+    let indexer = std::sync::Arc::clone(&state.indexer);
     if !indexer.is_loaded() {
         return Ok(Vec::new());
     }
-    let _in_flight = indexer.query_in_flight.enter();
 
-    let metadata = indexer.metadata.read();
-    let content_index = indexer.content_index.read();
-    let unit_store = indexer.unit_store.read();
-    let cfg = indexer.config.read();
-    let max_results = cfg.max_results;
-    let semantic_enabled = cfg.semantic_enabled;
-
-    let results = crate::util::pools::query_pool().install(|| {
-        SearchDispatcher::search(
-            &query,
-            &metadata,
-            &content_index,
-            Some(&unit_store),
-            semantic_enabled,
-            max_results,
-        )
-    });
-    drop(_in_flight);
+    // CPU-bound and lock-holding: keep it off the async runtime workers.
+    let results = tauri::async_runtime::spawn_blocking(move || {
+        let _in_flight = indexer.query_in_flight.enter();
+        let (max_results, semantic_enabled) = {
+            let cfg = indexer.config.read();
+            (cfg.max_results, cfg.semantic_enabled)
+        };
+        let metadata = indexer.metadata.read();
+        let content_index = indexer.content_index.read();
+        let unit_store = indexer.unit_store.read();
+        crate::util::pools::query_pool().install(|| {
+            SearchDispatcher::search(
+                &query,
+                &metadata,
+                &content_index,
+                Some(&unit_store),
+                semantic_enabled,
+                max_results,
+            )
+        })
+    })
+    .await
+    .map_err(|e| format!("Search task failed: {}", e))?;
     record_query_latency(started.elapsed().as_micros() as u64);
     Ok(results)
 }
@@ -1419,11 +1458,6 @@ pub fn clear_recent_queries() {
     crate::main_window::clear_recent_queries();
 }
 
-/// Wipes all Babbage state on the next launch.
-///
-/// The marker file is written now and consumed by `maybe_apply_pending_reset`
-/// before the restarted process opens the config, database or index. This keeps
-/// the removal ordering safe: no open handles exist when the directory is
 /// Runs the repair a Health check offers.
 ///
 /// One entry point instead of a command per row: the check names an action,
@@ -1496,15 +1530,28 @@ pub async fn run_doctor_action(
     }
 }
 
+/// Wipes all Babbage state on the next launch.
+///
+/// The marker file is written now and consumed by `maybe_apply_pending_reset`
+/// before the restarted process opens the config, database or index. This keeps
+/// the removal ordering safe: no open handles exist when the directory is
 /// deleted.
 #[tauri::command]
 pub async fn reset_all(
     app: AppHandle,
     confirm: String,
     remove_packs: Option<bool>,
+    state: State<'_, AppState>,
 ) -> Result<(), String> {
     if confirm != "RESET" {
         return Err("Reset cancelled: confirmation must be exactly \"RESET\".".to_string());
+    }
+    // A running daemon keeps the index and database open; wiping the
+    // directory under it would leave it serving (and writing) deleted files.
+    if state.daemon.is_some() {
+        return Err(
+            "The index is owned by the Babbage daemon. Stop the daemon, then reset.".to_string(),
+        );
     }
 
     let dir = BabbageConfig::config_dir();

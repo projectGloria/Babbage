@@ -509,6 +509,11 @@ pub struct SearchResponse {
     /// Server-side counts over the full matched set (before the display limit).
     #[serde(default)]
     pub facets: Facets,
+    /// True when a newer search superseded this one before it ran. The
+    /// response carries no results and clients must ignore it rather than
+    /// render it as an empty result set.
+    #[serde(default)]
+    pub cancelled: bool,
 }
 
 pub struct SearchDispatcher;
@@ -851,6 +856,7 @@ impl SearchDispatcher {
                 mode: "ranked".to_string(),
                 interpretation: Vec::new(),
                 facets: Facets::default(),
+                cancelled: false,
             };
         }
 
@@ -1155,6 +1161,7 @@ impl SearchDispatcher {
                 mode: "exhaustive".to_string(),
                 interpretation: intent.chips.clone(),
                 facets,
+                cancelled: false,
             };
         }
 
@@ -1645,6 +1652,7 @@ impl SearchDispatcher {
             mode: "ranked".to_string(),
             interpretation: intent.chips,
             facets,
+            cancelled: false,
         }
     }
 }

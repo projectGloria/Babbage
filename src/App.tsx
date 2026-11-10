@@ -271,19 +271,28 @@ function App() {
 
   useEffect(() => {
     if (!isSetupComplete) return;
+    let alive = true;
     invoke<IndexingStatus>("get_indexing_status")
-      .then(setIndexingStatus)
+      .then((status) => {
+        if (alive) setIndexingStatus(status);
+      })
       .catch((err) => console.error("Initial status error:", err));
 
     let unlisten: (() => void) | undefined;
-    listen<IndexingStatus>("indexing-status", (event) => setIndexingStatus(event.payload))
+    listen<IndexingStatus>("indexing-status", (event) => {
+      if (alive) setIndexingStatus(event.payload);
+    })
       .then((off) => {
-        unlisten = off;
+        // Unmounted before the subscription resolved: drop it right away,
+        // or the listener outlives the component.
+        if (alive) unlisten = off;
+        else off();
       })
       .catch((err) => console.error("Event listen error:", err));
 
     return () => {
-      if (unlisten) unlisten();
+      alive = false;
+      unlisten?.();
     };
   }, [isSetupComplete]);
 
@@ -325,6 +334,9 @@ function App() {
       queryRef.current = query;
       try {
         const res = await invoke<SearchResponse>("search", { query: query.trim(), sort });
+        // A cancelled response means a newer search is already on its way;
+        // rendering it would flash an empty list.
+        if (res.cancelled) return;
         if (seq >= currentSeqRef.current) {
           // Seed rows with snippets already fetched for these paths so a
           // repeated path never flashes snippet-less. Existing snippets are
@@ -359,9 +371,6 @@ function App() {
           setInterpretation(res.interpretation ?? []);
           setFacets(res.facets);
           setSelectedIndex(0);
-          if (merged.length > 0 && query.trim()) {
-            recordQuery(query);
-          }
 
           // Snippets are fetched by the visibility observer below (or the
           // no-IntersectionObserver fallback) so off-screen rows never pay
@@ -375,7 +384,17 @@ function App() {
     }, 40);
 
     return () => clearTimeout(timer);
-  }, [query, sort, isSetupComplete, recordQuery]);
+  }, [query, sort, isSetupComplete]);
+
+  // Record a query in recent searches only once the user has paused on it
+  // and it found something. Recording every settled keystroke filled the
+  // list with prefixes ("inv", "invo", "invoi", …).
+  useEffect(() => {
+    const trimmed = query.trim();
+    if (!trimmed || results.length === 0 || resultsQueryRef.current !== trimmed) return;
+    const timer = setTimeout(() => recordQuery(trimmed), 1500);
+    return () => clearTimeout(timer);
+  }, [query, results.length, recordQuery]);
 
   // Fetch snippets only for rows that are actually visible (or the first 20
   // when IntersectionObserver is unavailable). Results are patched by path
@@ -500,6 +519,8 @@ function App() {
   const loadingRef = useRef(false);
   const resultsLenRef = useRef(0);
   resultsLenRef.current = results.length;
+  const pageKeyRef = useRef(pageKey);
+  pageKeyRef.current = pageKey;
 
   const loadMore = useCallback(async () => {
     if (loadingRef.current || !query.trim() || exhaustedKey === pageKey) return;
@@ -509,8 +530,10 @@ function App() {
     try {
       const offset = resultsLenRef.current;
       const res = await invoke<SearchResponse>("search", { query: query.trim(), sort, offset });
-      // Discard a page for a query the user has already left.
-      if (queryRef.current !== query) return;
+      // Discard a page for a query (or sort order) the user has already
+      // left, and pages requested before the current results arrived.
+      if (res.cancelled || pageKeyRef.current !== requestKey) return;
+      if (resultsQueryRef.current !== query.trim() || resultsLenRef.current !== offset) return;
       let added = 0;
       setResults((prev) => {
         const seen = new Set(prev.map((r) => r.path));
