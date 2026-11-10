@@ -55,6 +55,7 @@ fn main() {
     };
 
     let manager = IndexerManager::new(config);
+    manager.wait_for_load();
 
     let (fresh, st) = crawl(&manager);
     println!(

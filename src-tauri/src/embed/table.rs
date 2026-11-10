@@ -71,13 +71,29 @@ impl StaticTable {
     /// same message and send whoever is debugging to look at the wrong thing.
     pub fn load_with_f32_reason(dir: &Path, use_f32: bool) -> Result<Self, String> {
         let use_f32 = use_f32 || std::env::var_os("BABBAGE_F32_TABLE").is_some();
+        match Self::load_inner(dir, use_f32, true) {
+            // A cache that parses but disagrees with the tokenizer or the
+            // expected width must never make the model unusable: retry from
+            // the f32 source, which also rewrites the cache.
+            Err(_) if !use_f32 && q8_cache::exists(&dir.join("model.safetensors")) => {
+                Self::load_inner(dir, use_f32, false)
+            }
+            result => result,
+        }
+    }
+
+    fn load_inner(dir: &Path, use_f32: bool, allow_cache: bool) -> Result<Self, String> {
         let model_path = dir.join("model.safetensors");
         // The quantised table is cached next to the source matrix, so a
         // process start (every CLI call, every MCP server) reads 7 MB instead
         // of reading 30 MB of f32 and quantising it again.
-        let cached = (!use_f32)
+        let cached = (!use_f32 && allow_cache)
             .then(|| q8_cache::read(&model_path))
-            .flatten();
+            .flatten()
+            .filter(|cache| {
+                cache.dim == EMBEDDING_DIM
+                    && safetensors_shape(&model_path) == Some((cache.vocab_size, cache.dim))
+            });
         let (embeddings, vocab_size, dim) = if let Some(cache) = cached.as_ref() {
             (Vec::new(), cache.vocab_size, cache.dim)
         } else {
@@ -474,7 +490,15 @@ fn parse_tokenizer(value: &Value, vocab_size: usize) -> Option<TokenizerParts> {
 }
 
 /// Parses one safetensors file and returns `(embeddings, vocab_size, dim)`.
-fn parse_safetensors<R: Read + Seek>(reader: &mut R) -> Option<(Vec<f32>, usize, usize)> {
+/// Rows and width of the source matrix, read from the safetensors header
+/// only. Used to check that a q8 cache really describes this file.
+fn safetensors_shape(path: &Path) -> Option<(usize, usize)> {
+    let mut file = File::open(path).ok()?;
+    let (_, shape, _, _) = read_safetensors_header(&mut file)?;
+    (shape.len() == 2).then(|| (shape[0], shape[1]))
+}
+
+fn read_safetensors_header<R: Read>(reader: &mut R) -> Option<(String, Vec<usize>, u64, u64)> {
     let mut length_bytes = [0u8; 8];
     reader.read_exact(&mut length_bytes).ok()?;
     let header_len = u64::from_le_bytes(length_bytes);
@@ -508,8 +532,11 @@ fn parse_safetensors<R: Read + Seek>(reader: &mut R) -> Option<(Vec<f32>, usize,
         }
         found?
     };
+    Some(selected)
+}
 
-    let (dtype, shape, begin, end) = selected;
+fn parse_safetensors<R: Read + Seek>(reader: &mut R) -> Option<(Vec<f32>, usize, usize)> {
+    let (dtype, shape, begin, end) = read_safetensors_header(reader)?;
     if shape.len() != 2 {
         return None;
     }
@@ -534,7 +561,8 @@ fn parse_safetensors<R: Read + Seek>(reader: &mut R) -> Option<(Vec<f32>, usize,
         return None;
     }
 
-    let data_start = 8u64.checked_add(header_len as u64)?;
+    // The header reader leaves the cursor at the end of the header.
+    let data_start = reader.stream_position().ok()?;
     reader
         .seek(SeekFrom::Start(data_start.checked_add(begin)?))
         .ok()?;
@@ -713,6 +741,50 @@ mod tests {
         assert_eq!(vocab_size, 1);
         assert_eq!(dim, EMBEDDING_DIM);
         assert_eq!(&embeddings[..4], &[1.0, -2.0, 0.5, 0.0]);
+    }
+
+    #[test]
+    fn stale_or_mismatched_q8_cache_falls_back_to_quantizing() {
+        let dir = temp_dir("q8-fallback");
+        std::fs::create_dir_all(&dir).unwrap();
+        let rows = 4usize;
+        let mut data = Vec::with_capacity(rows * EMBEDDING_DIM * 4);
+        for i in 0..rows * EMBEDDING_DIM {
+            data.extend_from_slice(&((i % 7) as f32 - 3.0).to_le_bytes());
+        }
+        let model = dir.join("model.safetensors");
+        std::fs::write(&model, safetensors_bytes("F32", &[rows, EMBEDDING_DIM], &data)).unwrap();
+        std::fs::write(
+            dir.join("tokenizer.json"),
+            br#"{"model":{"vocab":{"[PAD]":0,"[UNK]":3,"hello":2,"world":1}}}"#,
+        )
+        .unwrap();
+
+        let fresh = StaticTable::load_with_f32_reason(&dir, false).expect("first load");
+        let cache = model.with_extension("q8");
+        assert!(cache.exists(), "first load writes the cache");
+        let cached = StaticTable::load_with_f32_reason(&dir, false).expect("cached load");
+        assert_eq!(fresh.embeddings_i8, cached.embeddings_i8);
+        assert_eq!(fresh.embedding_scales, cached.embedding_scales);
+
+        // A well-formed cache of the wrong width (same source key) is ignored.
+        q8_cache::write(&model, 2, 3, &[1, 2, 3, 4, 5, 6], &[1.0, 1.0]);
+        let table = StaticTable::load_with_f32_reason(&dir, false).expect("width fallback");
+        assert_eq!(table.embeddings_i8, fresh.embeddings_i8);
+
+        // A cache whose row count the tokenizer cannot use is retried from source.
+        q8_cache::write(&model, 1, EMBEDDING_DIM, &vec![0; EMBEDDING_DIM], &[1.0]);
+        let table = StaticTable::load_with_f32_reason(&dir, false).expect("vocab fallback");
+        assert_eq!(table.embeddings_i8, fresh.embeddings_i8);
+        // ...and the retry rewrote a usable cache.
+        let again = StaticTable::load_with_f32_reason(&dir, false).expect("rewritten cache");
+        assert_eq!(again.embeddings_i8, fresh.embeddings_i8);
+
+        // Garbage on disk is a miss, not an error.
+        std::fs::write(&cache, b"garbage").unwrap();
+        let table = StaticTable::load_with_f32_reason(&dir, false).expect("garbage fallback");
+        assert_eq!(table.embeddings_i8, fresh.embeddings_i8);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1086,6 +1158,10 @@ mod q8_cache {
         model.with_extension("q8")
     }
 
+    pub fn exists(model: &Path) -> bool {
+        cache_path(model).exists()
+    }
+
     fn source_key(model: &Path) -> Option<(u64, u64)> {
         let meta = std::fs::metadata(model).ok()?;
         let mtime = meta
@@ -1115,13 +1191,19 @@ mod q8_cache {
         let vocab_size = word(2) as usize;
         let dim = word(3) as usize;
         let cells = vocab_size.checked_mul(dim)?;
-        if bytes.len() != header + cells + vocab_size * 4 {
+        let expected = vocab_size
+            .checked_mul(4)
+            .and_then(|scales| scales.checked_add(cells))
+            .and_then(|body| body.checked_add(header))?;
+        if bytes.len() != expected {
             return None;
         }
         let quantized = bytes[header..header + cells].iter().map(|&b| b as i8).collect();
         let scales = bytes[header + cells..]
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect();
         Some(Cached {
             vocab_size,
@@ -1177,6 +1259,35 @@ mod q8_cache {
             assert_eq!(got.scales, vec![0.5, 0.25]);
             std::fs::write(&model, b"changed source").unwrap();
             assert!(read(&model).is_none());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn corrupt_or_truncated_cache_is_a_miss() {
+            let dir = std::env::temp_dir().join(format!("babbage-q8-corrupt-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let model = dir.join("model.safetensors");
+            std::fs::write(&model, b"source").unwrap();
+            write(&model, 2, 3, &[1, -2, 3, -4, 5, -6], &[0.5, 0.25]);
+            let path = cache_path(&model);
+            let good = std::fs::read(&path).unwrap();
+
+            std::fs::write(&path, &good[..good.len() - 1]).unwrap();
+            assert!(read(&model).is_none(), "truncated cache must miss");
+
+            let mut bad_magic = good.clone();
+            bad_magic[0] ^= 0xff;
+            std::fs::write(&path, &bad_magic).unwrap();
+            assert!(read(&model).is_none(), "wrong magic must miss");
+
+            std::fs::write(&path, b"BBG").unwrap();
+            assert!(read(&model).is_none(), "short header must miss");
+
+            // An absurd row count must not overflow or allocate.
+            let mut huge = good.clone();
+            huge[24..32].copy_from_slice(&u64::MAX.to_le_bytes());
+            std::fs::write(&path, &huge).unwrap();
+            assert!(read(&model).is_none(), "overflowing size must miss");
             let _ = std::fs::remove_dir_all(&dir);
         }
     }

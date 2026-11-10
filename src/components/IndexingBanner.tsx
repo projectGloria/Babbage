@@ -60,6 +60,7 @@ function describe(
         label: t("indexingBanner.rebuilding"),
         detail: status.current_status || t("indexingBanner.checking"),
       };
+    case "loading":
     case "paused":
     case "idle":
     case "error":

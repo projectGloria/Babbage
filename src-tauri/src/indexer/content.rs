@@ -764,6 +764,12 @@ impl ContentIndex {
         Ok(())
     }
 
+    /// Reloads the underlying Tantivy reader to pick up commits made by other
+    /// processes or writers.
+    pub fn reload(&self) -> Result<(), String> {
+        self.reader.reload().map_err(|e| e.to_string())
+    }
+
     pub fn search(
         &self,
         query_str: &str,

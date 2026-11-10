@@ -15,9 +15,11 @@ use crate::indexer::content::ContentIndex;
 use crate::indexer::metadata::MetadataStore;
 use crate::indexer::metadata_db::MetadataDb;
 use crate::search::{SearchDispatcher, SearchResponse};
+use parking_lot::{Mutex, RwLock};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Error returned whenever the GUI has not built an index yet.
 pub const NO_INDEX_MESSAGE: &str =
@@ -30,12 +32,16 @@ pub const NO_INDEX_MESSAGE: &str =
 /// transports (MCP) should open once per session.
 pub struct HeadlessIndex {
     pub config: BabbageConfig,
-    pub metadata: MetadataStore,
-    pub content: Option<ContentIndex>,
-    pub units: UnitStore,
-    pub visual: crate::embed::visual::VisualStore,
+    pub metadata: RwLock<MetadataStore>,
+    pub content: RwLock<Option<ContentIndex>>,
+    pub units: RwLock<UnitStore>,
+    pub visual: RwLock<crate::embed::visual::VisualStore>,
     pub model: std::sync::Arc<ModelRegistry>,
     dir: PathBuf,
+    last_freshness_check: Mutex<Instant>,
+    last_data_version: AtomicI64,
+    last_mtime: Mutex<Option<SystemTime>>,
+    last_meta_mtime: Mutex<Option<SystemTime>>,
 }
 
 impl HeadlessIndex {
@@ -77,6 +83,7 @@ impl HeadlessIndex {
         // Read-write is fine: WAL lets the GUI writer and this connection
         // coexist. Nothing on the headless path writes.
         let db = MetadataDb::open_in_dir(dir)?;
+        let last_data_version = db.data_version();
         let metadata = MetadataStore::with_db(db);
 
         let model = ModelRegistry::global();
@@ -95,21 +102,116 @@ impl HeadlessIndex {
         }
 
         let index_dir = dir.join("index");
-        let content = if index_dir.join("meta.json").exists() {
+        let meta_json_path = index_dir.join("meta.json");
+        let content = if meta_json_path.exists() {
             Some(ContentIndex::open_read_only(&index_dir)?)
         } else {
             None
         };
 
+        let last_mtime = std::fs::metadata(&db_path).and_then(|m| m.modified()).ok();
+        let last_meta_mtime = std::fs::metadata(&meta_json_path).and_then(|m| m.modified()).ok();
+
         Ok(Self {
             config,
-            metadata,
-            content,
-            units,
-            visual,
+            metadata: RwLock::new(metadata),
+            content: RwLock::new(content),
+            units: RwLock::new(units),
+            visual: RwLock::new(visual),
             model,
             dir: dir.to_path_buf(),
+            last_freshness_check: Mutex::new(Instant::now()),
+            last_data_version: AtomicI64::new(last_data_version),
+            last_mtime: Mutex::new(last_mtime),
+            last_meta_mtime: Mutex::new(last_meta_mtime),
         })
+    }
+
+    /// Checks whether the index has changed on disk and reloads if so,
+    /// throttled to check at most every few seconds (or ~10ms during tests).
+    pub fn refresh_if_needed(&self) {
+        let now = Instant::now();
+        {
+            let mut last = self.last_freshness_check.lock();
+            let interval = if cfg!(test) {
+                Duration::from_millis(10)
+            } else {
+                Duration::from_secs(2)
+            };
+            if now.duration_since(*last) < interval {
+                return;
+            }
+            *last = now;
+        }
+
+        self.refresh();
+    }
+
+    /// Force-checks and reloads the index if SQLite or Tantivy have changed.
+    pub fn refresh(&self) {
+        let index_dir = self.dir.join("index");
+        let meta_json_path = index_dir.join("meta.json");
+        let meta_mtime = std::fs::metadata(&meta_json_path).and_then(|m| m.modified()).ok();
+        let meta_mtime_changed = {
+            let mut last = self.last_meta_mtime.lock();
+            if *last != meta_mtime {
+                *last = meta_mtime;
+                true
+            } else {
+                false
+            }
+        };
+
+        {
+            let mut content_guard = self.content.write();
+            if let Some(content) = content_guard.as_ref() {
+                let _ = content.reload();
+            } else if meta_json_path.exists()
+                && let Ok(content) = ContentIndex::open_read_only(&index_dir)
+            {
+                *content_guard = Some(content);
+            }
+        }
+
+        let db_path = self.dir.join("metadata.db");
+        let current_db_mtime = std::fs::metadata(&db_path).and_then(|m| m.modified()).ok();
+        let db_mtime_changed = {
+            let mut last = self.last_mtime.lock();
+            if *last != current_db_mtime {
+                *last = current_db_mtime;
+                true
+            } else {
+                false
+            }
+        };
+
+        let current_data_version = self
+            .metadata
+            .read()
+            .db()
+            .map(|db| db.data_version())
+            .unwrap_or(0);
+        let prev_data_version = self.last_data_version.swap(current_data_version, Ordering::SeqCst);
+        let data_version_changed = current_data_version != prev_data_version;
+
+        if data_version_changed || db_mtime_changed || meta_mtime_changed {
+            let mut meta = self.metadata.write();
+            meta.load_from_db();
+
+            if let Some(db) = meta.db() {
+                let model = ModelRegistry::global();
+                let mut new_units = UnitStore::new(model.dim);
+                let mut new_visual = crate::embed::visual::VisualStore::default();
+                if let Ok(loaded) = db.load_all_units() {
+                    for (unit, vector) in loaded {
+                        new_units.add_unit(unit, &vector);
+                    }
+                }
+                let _ = db.load_visual_units_into(&mut new_visual);
+                *self.units.write() = new_units;
+                *self.visual.write() = new_visual;
+            }
+        }
     }
 
     /// Runs a query against the loaded index.
@@ -160,12 +262,16 @@ impl HeadlessIndex {
         offset: usize,
         with_snippets: bool,
     ) -> Result<SearchResponse, String> {
+        self.refresh_if_needed();
         let aliases = self.config.alias_pairs();
+        let metadata = self.metadata.read();
+        let content = self.content.read();
+        let units = self.units.read();
         Ok(SearchDispatcher::search_response_fast_sorted_with_snippets(
             query,
-            &self.metadata,
-            &self.content,
-            Some(&self.units),
+            &metadata,
+            &content,
+            Some(&units),
             self.config.semantic_enabled,
             limit,
             0,
@@ -189,9 +295,12 @@ impl HeadlessIndex {
         path: &str,
         limit: usize,
     ) -> Result<Vec<crate::embed::visual::SimilarImageResult>, String> {
+        self.refresh_if_needed();
         let p = Path::new(path);
-        let (source_node_id, query_vec) = if let Some(entry) = self.metadata.get(p) {
-            let vec_opt = self.visual.get_vector(entry.id).map(|v| v.to_vec());
+        let metadata = self.metadata.read();
+        let visual = self.visual.read();
+        let (source_node_id, query_vec) = if let Some(entry) = metadata.get(p) {
+            let vec_opt = visual.get_vector(entry.id).map(|v| v.to_vec());
             (Some(entry.id), vec_opt)
         } else {
             (None, None)
@@ -219,13 +328,12 @@ impl HeadlessIndex {
         };
 
         let floor = 0.30f32;
-        let hits = self
-            .visual
+        let hits = visual
             .find_similar(&query_vec, source_node_id, floor, limit);
 
         let mut results = Vec::new();
         for (node_id, similarity) in hits {
-            if let Some(entry) = self.metadata.get_by_node_id(node_id) {
+            if let Some(entry) = metadata.get_by_node_id(node_id) {
                 let is_image = entry
                     .path
                     .extension()
@@ -268,7 +376,7 @@ impl HeadlessIndex {
             "protocol_version": null,
             "watcher_ok": false,
             "db": self.dir.join("metadata.db").exists(),
-            "index": self.content.is_some(),
+            "index": self.content.read().is_some(),
             "model": state["active_model_id"].as_u64().is_some(),
             "state": state,
         })
@@ -284,17 +392,21 @@ impl HeadlessIndex {
     }
 
     pub fn state_local(&self) -> Result<Value, String> {
+        self.refresh_if_needed();
+        let metadata = self.metadata.read();
+        let content = self.content.read();
+        let units = self.units.read();
         let mut files = 0u64;
         let mut dirs = 0u64;
-        for i in 0..self.metadata.len() {
-            if self.metadata.node(i as u32).is_dir() {
+        for i in 0..metadata.len() {
+            if metadata.node(i as u32).is_dir() {
                 dirs += 1;
             } else {
                 files += 1;
             }
         }
 
-        let content_docs = self.content.as_ref().map(|c| c.num_docs()).unwrap_or(0);
+        let content_docs = content.as_ref().map(|c| c.num_docs()).unwrap_or(0);
         let index_bytes = dir_size_bytes(&self.dir.join("index"))
             .saturating_add(prefixed_file_bytes(&self.dir, "metadata.db"));
         let last_reconcile = last_modified_secs(&[
@@ -311,7 +423,7 @@ impl HeadlessIndex {
         // The units' model id is what the stored vectors were encoded with;
         // the active id is what a new query is embedded with. They can differ
         // until the GUI re-embeds after a model change.
-        let units_model_id = match self.metadata.db() {
+        let units_model_id = match metadata.db() {
             Some(db) => db.units_model_id()?,
             None => None,
         };
@@ -324,7 +436,7 @@ impl HeadlessIndex {
             "files": files,
             "dirs": dirs,
             "content_docs": content_docs,
-            "semantic_units": self.units.len() as u64,
+            "semantic_units": units.len() as u64,
             "index_bytes": index_bytes,
             "model_id": units_model_id,
             "active_model_id": self.model.model_id,
@@ -437,13 +549,17 @@ impl AgentSession<'_> {
                 serde_json::from_value(value).map_err(|e| e.to_string())
             }
             Self::Local(index) => {
+                index.refresh_if_needed();
+                let metadata = index.metadata.read();
+                let content = index.content.read();
+                let units = index.units.read();
                 // Callers pass a composed query that already carries
                 // `mode:exhaustive`; the keyset filter does the rest.
                 Ok(SearchDispatcher::search_response_exhaustive_after(
                     query.trim(),
-                    &index.metadata,
-                    &index.content,
-                    Some(&index.units),
+                    &metadata,
+                    &content,
+                    Some(&units),
                     index.config.semantic_enabled,
                     limit,
                     0,

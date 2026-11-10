@@ -20,4 +20,11 @@ fn main() {
         let _ = std::fs::copy(&src_dll, target_dir.join(dll_name));
         let _ = std::fs::copy(&src_dll, target_dir.join("deps").join(dll_name));
     }
+
+    #[cfg(windows)]
+    {
+        println!("cargo:rustc-link-arg=/DELAYLOAD:comctl32.dll");
+        println!("cargo:rustc-link-arg=delayimp.lib");
+        println!("cargo:rustc-link-arg=/IGNORE:4199");
+    }
 }

@@ -123,6 +123,9 @@ pub fn handle_request_session(
     request: &Value,
     reindex_enabled: bool,
 ) -> Option<Value> {
+    if let AgentSession::Local(index) = session {
+        index.refresh_if_needed();
+    }
     let Some(object) = request.as_object() else {
         return Some(error_response(
             Value::Null,
@@ -1204,6 +1207,80 @@ mod tests {
             &request(json!({"jsonrpc": "2.0", "method": "notifications/initialized"})),
         );
         assert!(response.is_none());
+    }
+
+    #[test]
+    fn request_handler_reloads_when_index_changes_while_session_is_open() {
+        let fixture = fixture_with_files("freshness", &[("doc1.txt", "initial apple text")]);
+        let index = fixture.index.as_ref().expect("headless index");
+
+        let search_doc1 = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "search",
+                "arguments": { "query": "apple" }
+            }
+        });
+        let res1 = handle_request(Some(index), &search_doc1).expect("search doc1");
+        let text1 = &res1["result"]["content"][0]["text"];
+        assert!(text1.as_str().unwrap().contains("doc1.txt"));
+
+        let search_doc2 = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "search",
+                "arguments": { "query": "banana" }
+            }
+        });
+        let res_before = handle_request(Some(index), &search_doc2).expect("search doc2 before");
+        let text_before = &res_before["result"]["content"][0]["text"];
+        assert!(!text_before.as_str().unwrap().contains("doc2.txt"));
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let file2 = fixture.dir.join("doc2.txt");
+        fs::write(&file2, "banana fruit text").unwrap();
+        let modified = fs::metadata(&file2)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let db = MetadataDb::open_in_dir(&fixture.dir).unwrap();
+        db.upsert(&FileEntry {
+            id: 2,
+            path: file2.clone(),
+            name: "doc2.txt".to_string(),
+            extension: crate::indexer::walker::intern_extension(Some("txt")),
+            size: 17,
+            modified,
+            is_dir: false,
+            dev: 0,
+            ino: 0,
+            char_bloom: crate::search::fuzzy::compute_char_mask("doc2.txt"),
+            content_pending: false,
+        })
+        .unwrap();
+        drop(db);
+
+        let content_index = ContentIndex::new(&fixture.dir.join("index")).unwrap();
+        content_index
+            .add_or_update(&file2, "doc2.txt", "banana fruit text", modified, 17, Some("txt"))
+            .unwrap();
+        content_index.commit().unwrap();
+
+        let res2 = handle_request(Some(index), &search_doc2).expect("search doc2 after");
+        let text2 = &res2["result"]["content"][0]["text"];
+        assert!(
+            text2.as_str().unwrap().contains("doc2.txt"),
+            "long-running session must see changes made while open: got {}",
+            text2
+        );
     }
 
     #[test]

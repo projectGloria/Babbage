@@ -88,6 +88,18 @@ impl MetadataDb {
     /// Used by [`Self::open`] and by tests so they never touch the real config
     /// directory.
     fn open_at(db_path: &Path) -> Result<Self, String> {
+        Self::open_at_reporting(db_path).map(|(db, _)| db)
+    }
+
+    /// Opens a database and reports whether schema migration ran.
+    ///
+    /// Opening used to replay every migration (a dozen `ALTER TABLE`s that
+    /// fail with "duplicate column name", the `CREATE INDEX IF NOT EXISTS`
+    /// set, `PRAGMA optimize` and a possible `VACUUM`) on every open, which
+    /// every CLI call and MCP session paid. The schema version now lives in
+    /// `PRAGMA user_version`; migration runs only when it is older than
+    /// [`SCHEMA_VERSION`]. Compaction moved to [`Self::run_maintenance_if_due`].
+    pub(crate) fn open_at_reporting(db_path: &Path) -> Result<(Self, bool), String> {
         let conn = Connection::open(db_path)
             .map_err(|e| format!("Failed to open metadata database: {}", e))?;
 
@@ -96,75 +108,11 @@ impl MetadataDb {
              PRAGMA synchronous=NORMAL;
              PRAGMA foreign_keys=ON;
              PRAGMA mmap_size=268435456;
-             PRAGMA journal_size_limit=67108864;
-             PRAGMA optimize;
-             CREATE TABLE IF NOT EXISTS nodes (
-               id INTEGER PRIMARY KEY,
-               path TEXT NOT NULL UNIQUE,
-               name TEXT NOT NULL,
-               extension TEXT,
-               size INTEGER NOT NULL,
-               modified INTEGER NOT NULL,
-               is_dir INTEGER NOT NULL,
-               created_gen INTEGER NOT NULL DEFAULT 0,
-               dev INTEGER NOT NULL DEFAULT 0,
-               ino INTEGER NOT NULL DEFAULT 0
-             );
-             -- `path` is UNIQUE, which already indexes it; a second
-             -- index on the same column only slowed every write.
-             DROP INDEX IF EXISTS nodes_path;
-             CREATE TABLE IF NOT EXISTS usage (
-               path TEXT PRIMARY KEY,
-               opens INTEGER NOT NULL DEFAULT 0,
-               last_open INTEGER NOT NULL DEFAULT 0
-             );
-             CREATE TABLE IF NOT EXISTS units (
-               id INTEGER PRIMARY KEY,
-               node_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
-               byte_start INTEGER NOT NULL,
-               byte_end INTEGER NOT NULL,
-               model_id INTEGER NOT NULL,
-               vec BLOB
-             );
-             CREATE INDEX IF NOT EXISTS units_node ON units(node_id);
-             CREATE TABLE IF NOT EXISTS meta (
-               key TEXT PRIMARY KEY,
-               value TEXT NOT NULL
-             );
-             INSERT OR IGNORE INTO meta (key, value) VALUES ('model_id', '1');
-             INSERT OR IGNORE INTO meta (key, value) VALUES ('embedding_dim', '256');",
+             PRAGMA journal_size_limit=67108864;",
         )
         .map_err(|e| format!("Failed to initialize metadata database: {}", e))?;
 
-        // Migration for databases created before file identity was tracked.
-        // `ALTER TABLE ... ADD COLUMN` fails with "duplicate column name" when
-        // the column already exists, which is expected and safe to ignore.
-        for ddl in [
-            "ALTER TABLE nodes ADD COLUMN dev INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE nodes ADD COLUMN ino INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE nodes ADD COLUMN indexed_gen INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE nodes ADD COLUMN content_hash TEXT",
-            "ALTER TABLE nodes ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE nodes ADD COLUMN width INTEGER",
-            "ALTER TABLE nodes ADD COLUMN height INTEGER",
-            "ALTER TABLE nodes ADD COLUMN phash INTEGER",
-            "ALTER TABLE nodes ADD COLUMN burst INTEGER",
-            "ALTER TABLE nodes ADD COLUMN look INTEGER",
-            "ALTER TABLE nodes ADD COLUMN text_sig BLOB",
-            "ALTER TABLE nodes ADD COLUMN content_pending INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE units ADD COLUMN vec BLOB",
-        ] {
-            if let Err(e) = conn.execute(ddl, []) {
-                let message = e.to_string();
-                if !message.contains("duplicate column name") {
-                    eprintln!("[Babbage] Metadata migration warning: {}", message);
-                }
-            }
-        }
-
-        // Burst grouping and the missing-hash/backfill scans are image-only.
-        let _ = conn.execute("CREATE INDEX IF NOT EXISTS nodes_burst ON nodes(burst)", []);
-        let _ = conn.execute("CREATE INDEX IF NOT EXISTS nodes_phash ON nodes(phash)", []);
+        let migrated = migrate(&conn)?;
 
         // Image hash space version. Bumping it invalidates stored hashes so
         // `/dupes` never mixes hashes computed from different sources.
@@ -188,57 +136,6 @@ impl MetadataDb {
             );
         }
 
-        // Must run after the `dev`/`ino` columns are guaranteed to exist.
-        if let Err(e) = conn.execute(
-            "CREATE INDEX IF NOT EXISTS nodes_dev_ino ON nodes(dev, ino)",
-            [],
-        ) {
-            eprintln!("[Babbage] Failed to create dev/ino index: {}", e);
-        }
-
-        // Partial index for embedding queue: fast lookup of unembedded nodes
-        if let Err(e) = conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_nodes_unembedded ON nodes(indexed_gen) WHERE indexed_gen = 0",
-            [],
-        ) {
-            eprintln!("[Babbage] Failed to create unembedded index: {}", e);
-        }
-
-        // The embedding queue orders unembedded rows by `modified`, so the
-        // partial index above still needed a full scan plus a temp b-tree on
-        // every poll. Cover the order too.
-        if let Err(e) = conn.execute(
-            "CREATE INDEX IF NOT EXISTS nodes_unembedded_modified
-             ON nodes(modified DESC, size) WHERE indexed_gen = 0",
-            [],
-        ) {
-            eprintln!("[Babbage] Failed to create unembedded order index: {}", e);
-        }
-
-        // Burst grouping probes candidates by neighbourhood, image dimensions
-        // and orientation. Without this it full-scans `nodes` once per image
-        // during a crawl and again in the backfill.
-        if let Err(e) = conn.execute(
-            "CREATE INDEX IF NOT EXISTS nodes_burst_candidates
-             ON nodes(is_dir, modified, width, height)",
-            [],
-        ) {
-            eprintln!("[Babbage] Failed to create burst candidate index: {}", e);
-        }
-
-        // Dedicated storage for visual embeddings (K18).
-        if let Err(e) = conn.execute(
-            "CREATE TABLE IF NOT EXISTS visual_units (
-                node_id INTEGER PRIMARY KEY,
-                model_id INTEGER NOT NULL,
-                dhash INTEGER NOT NULL,
-                vec BLOB NOT NULL
-            )",
-            [],
-        ) {
-            eprintln!("[Babbage] Failed to create visual_units table: {}", e);
-        }
-
         let db = Self {
             conn: Mutex::new({
                 // ~25 hot statements are cached; the default holds 16.
@@ -247,11 +144,52 @@ impl MetadataDb {
             }),
         };
 
-        // Reclaim a bloated free list at startup. Best-effort: a busy or
-        // read-only database must never prevent Babbage from opening.
-        db.compact_if_bloated();
+        Ok((db, migrated))
+    }
 
-        Ok(db)
+    /// `PRAGMA optimize` plus [`Self::compact_if_bloated`], at most once per
+    /// [`MAINTENANCE_INTERVAL_SECS`]. Returns whether it ran.
+    ///
+    /// Meant for a background thread after startup: a `VACUUM` rewrites the
+    /// whole file and holds the connection while it does, so it must never
+    /// sit on the open path. Best-effort; a read-only or busy database just
+    /// skips it.
+    pub fn run_maintenance_if_due(&self, now_unix_secs: i64) -> bool {
+        let last: i64 = {
+            let conn = self.conn.lock();
+            conn.query_row(
+                "SELECT value FROM meta WHERE key = 'last_maintenance'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+        };
+        if now_unix_secs.saturating_sub(last) < MAINTENANCE_INTERVAL_SECS {
+            return false;
+        }
+        {
+            let conn = self.conn.lock();
+            if let Err(e) = conn.execute_batch("PRAGMA optimize;") {
+                eprintln!("[Babbage] Metadata DB optimize skipped: {}", e);
+            }
+        }
+        self.compact_if_bloated();
+        let conn = self.conn.lock();
+        let _ = conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('last_maintenance', ?1)",
+            [now_unix_secs.to_string()],
+        );
+        true
+    }
+
+    /// Returns SQLite's data_version, which increments whenever another
+    /// database connection commits changes to the database.
+    pub fn data_version(&self) -> i64 {
+        let conn = self.conn.lock();
+        conn.query_row("PRAGMA data_version", [], |row| row.get(0))
+            .unwrap_or(0)
     }
 
     /// VACUUMs the database when a large fraction of its pages are free.
@@ -1548,6 +1486,171 @@ impl MetadataDb {
     }
 }
 
+/// Version of the open-time schema (tables, added columns, indexes).
+///
+/// Bump it whenever [`migrate`] gains a step. Databases written before
+/// versioning report 0 and run the full, idempotent migration once.
+pub(crate) const SCHEMA_VERSION: i64 = 1;
+
+/// Minimum spacing between [`MetadataDb::run_maintenance_if_due`] runs.
+const MAINTENANCE_INTERVAL_SECS: i64 = 24 * 60 * 60;
+
+/// Brings the schema up to [`SCHEMA_VERSION`]. Returns whether it did work.
+///
+/// Every step is idempotent, so an unversioned database of any age (or two
+/// processes racing on first open) converges on the same schema. The check
+/// is repeated inside `BEGIN IMMEDIATE` so only one of them does the work.
+fn migrate(conn: &Connection) -> Result<bool, String> {
+    let version = |conn: &Connection| -> i64 {
+        conn.query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap_or(0)
+    };
+    if version(conn) >= SCHEMA_VERSION {
+        return Ok(false);
+    }
+    conn.execute_batch("BEGIN IMMEDIATE")
+        .map_err(|e| format!("Failed to begin metadata migration: {}", e))?;
+    if version(conn) >= SCHEMA_VERSION {
+        let _ = conn.execute_batch("COMMIT");
+        return Ok(false);
+    }
+    let result = (|| -> Result<(), String> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS nodes (
+               id INTEGER PRIMARY KEY,
+               path TEXT NOT NULL UNIQUE,
+               name TEXT NOT NULL,
+               extension TEXT,
+               size INTEGER NOT NULL,
+               modified INTEGER NOT NULL,
+               is_dir INTEGER NOT NULL,
+               created_gen INTEGER NOT NULL DEFAULT 0,
+               dev INTEGER NOT NULL DEFAULT 0,
+               ino INTEGER NOT NULL DEFAULT 0
+             );
+             -- `path` is UNIQUE, which already indexes it; a second
+             -- index on the same column only slowed every write.
+             DROP INDEX IF EXISTS nodes_path;
+             CREATE TABLE IF NOT EXISTS usage (
+               path TEXT PRIMARY KEY,
+               opens INTEGER NOT NULL DEFAULT 0,
+               last_open INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE IF NOT EXISTS units (
+               id INTEGER PRIMARY KEY,
+               node_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+               byte_start INTEGER NOT NULL,
+               byte_end INTEGER NOT NULL,
+               model_id INTEGER NOT NULL,
+               vec BLOB
+             );
+             CREATE INDEX IF NOT EXISTS units_node ON units(node_id);
+             CREATE TABLE IF NOT EXISTS meta (
+               key TEXT PRIMARY KEY,
+               value TEXT NOT NULL
+             );
+             INSERT OR IGNORE INTO meta (key, value) VALUES ('model_id', '1');
+             INSERT OR IGNORE INTO meta (key, value) VALUES ('embedding_dim', '256');",
+        )
+        .map_err(|e| format!("Failed to initialize metadata database: {}", e))?;
+
+        // Migration for databases created before file identity was tracked.
+        // `ALTER TABLE ... ADD COLUMN` fails with "duplicate column name" when
+        // the column already exists, which is expected and safe to ignore.
+        for ddl in [
+            "ALTER TABLE nodes ADD COLUMN dev INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE nodes ADD COLUMN ino INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE nodes ADD COLUMN indexed_gen INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE nodes ADD COLUMN content_hash TEXT",
+            "ALTER TABLE nodes ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE nodes ADD COLUMN width INTEGER",
+            "ALTER TABLE nodes ADD COLUMN height INTEGER",
+            "ALTER TABLE nodes ADD COLUMN phash INTEGER",
+            "ALTER TABLE nodes ADD COLUMN burst INTEGER",
+            "ALTER TABLE nodes ADD COLUMN look INTEGER",
+            "ALTER TABLE nodes ADD COLUMN text_sig BLOB",
+            "ALTER TABLE nodes ADD COLUMN content_pending INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE units ADD COLUMN vec BLOB",
+        ] {
+            if let Err(e) = conn.execute(ddl, []) {
+                let message = e.to_string();
+                if !message.contains("duplicate column name") {
+                    eprintln!("[Babbage] Metadata migration warning: {}", message);
+                }
+            }
+        }
+
+        // Burst grouping and the missing-hash/backfill scans are image-only.
+        let _ = conn.execute("CREATE INDEX IF NOT EXISTS nodes_burst ON nodes(burst)", []);
+        let _ = conn.execute("CREATE INDEX IF NOT EXISTS nodes_phash ON nodes(phash)", []);
+
+        // Must run after the `dev`/`ino` columns are guaranteed to exist.
+        if let Err(e) = conn.execute(
+            "CREATE INDEX IF NOT EXISTS nodes_dev_ino ON nodes(dev, ino)",
+            [],
+        ) {
+            eprintln!("[Babbage] Failed to create dev/ino index: {}", e);
+        }
+
+        // Partial index for embedding queue: fast lookup of unembedded nodes
+        if let Err(e) = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_nodes_unembedded ON nodes(indexed_gen) WHERE indexed_gen = 0",
+            [],
+        ) {
+            eprintln!("[Babbage] Failed to create unembedded index: {}", e);
+        }
+
+        // The embedding queue orders unembedded rows by `modified`, so the
+        // partial index above still needed a full scan plus a temp b-tree on
+        // every poll. Cover the order too.
+        if let Err(e) = conn.execute(
+            "CREATE INDEX IF NOT EXISTS nodes_unembedded_modified
+             ON nodes(modified DESC, size) WHERE indexed_gen = 0",
+            [],
+        ) {
+            eprintln!("[Babbage] Failed to create unembedded order index: {}", e);
+        }
+
+        // Burst grouping probes candidates by neighbourhood, image dimensions
+        // and orientation. Without this it full-scans `nodes` once per image
+        // during a crawl and again in the backfill.
+        if let Err(e) = conn.execute(
+            "CREATE INDEX IF NOT EXISTS nodes_burst_candidates
+             ON nodes(is_dir, modified, width, height)",
+            [],
+        ) {
+            eprintln!("[Babbage] Failed to create burst candidate index: {}", e);
+        }
+
+        // Dedicated storage for visual embeddings (K18).
+        if let Err(e) = conn.execute(
+            "CREATE TABLE IF NOT EXISTS visual_units (
+                node_id INTEGER PRIMARY KEY,
+                model_id INTEGER NOT NULL,
+                dhash INTEGER NOT NULL,
+                vec BLOB NOT NULL
+            )",
+            [],
+        ) {
+            eprintln!("[Babbage] Failed to create visual_units table: {}", e);
+        }
+
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+            .map_err(|e| format!("Failed to record metadata schema version: {}", e))?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => conn
+            .execute_batch("COMMIT")
+            .map(|_| true)
+            .map_err(|e| format!("Failed to commit metadata migration: {}", e)),
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
+}
+
 /// Whether a database is bloated enough to justify a `VACUUM`.
 ///
 /// Requires both a meaningful absolute free list (more than 1000 pages) and a
@@ -1652,6 +1755,113 @@ mod tests {
             .into_iter()
             .map(|entry| entry.path)
             .collect()
+    }
+
+    fn columns(db: &MetadataDb, table: &str) -> Vec<String> {
+        let conn = db.conn.lock();
+        let mut stmt = conn
+            .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))
+            .unwrap();
+        stmt.query_map([], |row| row.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    fn user_version(db: &MetadataDb) -> i64 {
+        db.conn
+            .lock()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn fresh_database_migrates_once_and_records_the_version() {
+        let temp = TempDb::new("schema-fresh");
+        let path = temp.dir.join("fresh.db");
+        let (db, migrated) = MetadataDb::open_at_reporting(&path).expect("open fresh");
+        assert!(migrated, "a new database must run the migration");
+        assert_eq!(user_version(&db), SCHEMA_VERSION);
+        let nodes = columns(&db, "nodes");
+        for col in ["dev", "ino", "content_pending", "phash", "text_sig"] {
+            assert!(nodes.iter().any(|c| c == col), "missing nodes.{col}");
+        }
+        assert!(columns(&db, "visual_units").iter().any(|c| c == "dhash"));
+        drop(db);
+
+        let (db, migrated) = MetadataDb::open_at_reporting(&path).expect("reopen");
+        assert!(!migrated, "a current database must not migrate again");
+        assert_eq!(user_version(&db), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn unversioned_old_schema_gains_missing_columns_and_keeps_rows() {
+        let temp = TempDb::new("schema-old");
+        let path = temp.dir.join("old.db");
+        {
+            // A database from before file identity, hashes and visual units.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE nodes (
+                   id INTEGER PRIMARY KEY,
+                   path TEXT NOT NULL UNIQUE,
+                   name TEXT NOT NULL,
+                   extension TEXT,
+                   size INTEGER NOT NULL,
+                   modified INTEGER NOT NULL,
+                   is_dir INTEGER NOT NULL
+                 );
+                 CREATE TABLE units (
+                   id INTEGER PRIMARY KEY,
+                   node_id INTEGER NOT NULL,
+                   byte_start INTEGER NOT NULL,
+                   byte_end INTEGER NOT NULL,
+                   model_id INTEGER NOT NULL
+                 );
+                 INSERT INTO nodes (path, name, extension, size, modified, is_dir)
+                 VALUES ('/old/a.txt', 'a.txt', 'txt', 3, 10, 0);",
+            )
+            .unwrap();
+        }
+        let (db, migrated) = MetadataDb::open_at_reporting(&path).expect("open old");
+        assert!(migrated, "a database without a version must migrate");
+        assert_eq!(user_version(&db), SCHEMA_VERSION);
+        let nodes = columns(&db, "nodes");
+        for col in [
+            "dev", "ino", "indexed_gen", "content_hash", "retry_count", "width", "height",
+            "phash", "burst", "look", "text_sig", "content_pending",
+        ] {
+            assert!(nodes.iter().any(|c| c == col), "missing nodes.{col}");
+        }
+        assert!(columns(&db, "units").iter().any(|c| c == "vec"));
+        let loaded = db.load_all().expect("load rows");
+        assert_eq!(loaded.len(), 1, "existing rows survive the migration");
+        drop(db);
+
+        let (_db, migrated) = MetadataDb::open_at_reporting(&path).expect("reopen");
+        assert!(!migrated, "second open does no migration work");
+    }
+
+    #[test]
+    fn maintenance_runs_at_most_once_a_day_and_not_on_open() {
+        let temp = TempDb::new("maintenance");
+        let db = temp.db();
+        let last = |db: &MetadataDb| -> Option<String> {
+            db.conn
+                .lock()
+                .query_row(
+                    "SELECT value FROM meta WHERE key = 'last_maintenance'",
+                    [],
+                    |row| row.get(0),
+                )
+                .ok()
+        };
+        assert_eq!(last(db), None, "opening must not run maintenance");
+        let now = 1_700_000_000;
+        assert!(db.run_maintenance_if_due(now));
+        assert_eq!(last(db).as_deref(), Some("1700000000"));
+        assert!(!db.run_maintenance_if_due(now + 3600), "within a day: skipped");
+        assert!(db.run_maintenance_if_due(now + MAINTENANCE_INTERVAL_SECS));
     }
 
     #[test]

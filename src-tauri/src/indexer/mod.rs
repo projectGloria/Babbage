@@ -16,6 +16,7 @@ use crate::indexer::content::{
     ContentIndex, is_indexable_extension, is_indexable_file_name, read_text_content_checked,
 };
 use crate::indexer::metadata::MetadataStore;
+use crate::indexer::metadata_db::MetadataDb;
 use crate::indexer::walker::{FileEntry, is_cloud_placeholder_path, walk_directories};
 use crate::indexer::watcher::{WatcherHandle, start_file_watcher};
 use crate::search::{SearchDispatcher, SearchResponse, SortOrder};
@@ -23,7 +24,7 @@ use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
@@ -289,190 +290,349 @@ pub struct IndexerManager {
     is_running: Arc<AtomicBool>,
     watcher_handle: Arc<Mutex<Option<WatcherHandle>>>,
     app_handle: Arc<RwLock<Option<tauri::AppHandle>>>,
+    pub is_loaded: Arc<AtomicBool>,
+    start_indexing_pending: Arc<AtomicBool>,
+    pub data_dir: PathBuf,
 }
 
 impl IndexerManager {
     pub fn new(config: BabbageConfig) -> Self {
+        Self::new_in(config, &BabbageConfig::config_dir())
+    }
+
+    pub fn new_in(config: BabbageConfig, data_dir: &Path) -> Self {
         // Apply the opt-in external extractor registry before any crawl starts.
         crate::indexer::extract::set_external_extractors(config.extractors.clone());
         crate::indexer::extract::image::set_ocr_max_image_bytes(config.ocr_max_image_bytes);
         crate::indexer::extract::set_content_caps(config.content_max_file_size_mb, config.content_max_text_bytes);
         crate::embed::set_max_semantic_units(config.content_max_semantic_units);
-        let index_dir = BabbageConfig::index_dir();
-        let content_index = match ContentIndex::new(&index_dir) {
-            Ok(idx) => Some(idx),
-            Err(e) => {
-                crate::say_err!("[Babbage] Failed to create Tantivy index: {}", e);
-                None
-            }
-        };
-        let content_rebuilt = content_index.as_ref().is_some_and(|index| index.rebuilt);
 
-        let metadata_store = Arc::new(RwLock::new(MetadataStore::new()));
+        let metadata_store = Arc::new(RwLock::new(MetadataStore::without_db()));
+        let content_index = Arc::new(RwLock::new(None));
         let unit_store = Arc::new(RwLock::new(UnitStore::new(EMBEDDING_DIM)));
         let visual_store = Arc::new(RwLock::new(crate::embed::visual::VisualStore::new(
             crate::embed::visual::VISUAL_DIM,
             crate::embed::visual::MOCK_VISUAL_MODEL_ID,
         )));
         let query_in_flight = Arc::new(crate::util::pools::QueryFlag::new());
+        let is_loaded = Arc::new(AtomicBool::new(false));
+        let start_indexing_pending = Arc::new(AtomicBool::new(false));
 
-        // Semantic state (the ~30 MB embedding table and the persisted unit
-        // vectors) is only loaded when semantic search is actually enabled.
-        // With it off the indexer stays a plain lexical index and keeps that
-        // memory free.
-        let semantic_enabled = config.semantic_enabled;
+        let status = Arc::new(RwLock::new(IndexingStatus {
+            is_indexing: false,
+            files_indexed: 0,
+            content_indexed: 0,
+            current_status: "Loading index...".to_string(),
+            is_embedding: false,
+            units_indexed: 0,
+            semantic_ready: false,
+            phase: "loading".to_string(),
+            total_files: 0,
+            extract_done: 0,
+            extract_total: 0,
+            paused: false,
+        }));
 
-        // Discard semantic units produced by a different embedding model; the
-        // embedding worker re-queues every node once it starts.
-        if semantic_enabled && let Some(db) = metadata_store.read().db() {
-            let expected_model_id = ModelRegistry::global().model_id;
-            match db.units_model_id() {
-                Ok(Some(existing_model_id)) if existing_model_id != expected_model_id => {
-                    match db.reset_semantic_index() {
-                        Ok(()) => {
-                            unit_store.write().clear();
-                            log::info!(
-                                "[Babbage] Semantic model changed (units id {} -> {}); reset semantic index",
-                                existing_model_id,
-                                expected_model_id
-                            );
-                        }
-                        Err(e) => {
-                            crate::say_err!("[Babbage] Failed to reset semantic index: {}", e);
-                        }
-                    }
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    crate::say_err!("[Babbage] Failed to read semantic model id: {}", e);
-                }
-            }
-        }
-
-        // Load persisted units from database. These are required for semantic
-        // search even if the user toggles the tier on later in this session, so
-        // they are always restored; only the embedding table is lazy.
-        let mut units_count = 0;
-        if let Some(db) = metadata_store.read().db() {
-            let mut store = unit_store.write();
-            match db.load_units_into(&mut store) {
-                Ok(count) => {
-                    units_count = count;
-                    if units_count > 0 {
-                        crate::say!(
-                            "[Babbage] Loaded {} semantic units from database",
-                            units_count
-                        );
-                    }
-                }
-                Err(e) => {
-                    crate::say_err!("[Babbage] Failed to load semantic units: {}", e);
-                }
-            }
-            let mut vstore = visual_store.write();
-            let _ = db.load_visual_units_into(&mut vstore);
-        }
-
-        if content_rebuilt {
-            let marked = metadata_store.write().mark_all_content_pending();
-            crate::say_err!(
-                "[Babbage] Content index schema upgraded; {} file(s) queued for re-indexing",
-                marked
-            );
-        }
-
-        Self {
+        let mgr = Self {
             metadata: metadata_store,
-            content_index: Arc::new(RwLock::new(content_index)),
+            content_index,
             unit_store,
             visual_store,
             embedding_queue: Arc::new(Mutex::new(None)),
             query_in_flight,
             config: Arc::new(RwLock::new(config)),
-            status: Arc::new(RwLock::new(IndexingStatus {
-                is_indexing: false,
-                files_indexed: 0,
-                content_indexed: 0,
-                current_status: "Idle".to_string(),
-                is_embedding: false,
-                units_indexed: units_count,
-                semantic_ready: units_count > 0,
-                phase: "idle".to_string(),
-                total_files: 0,
-                extract_done: 0,
-                extract_total: 0,
-                paused: false,
-            })),
+            status,
             crawl_start_unix_ms: Arc::new(AtomicU64::new(0)),
             last_reconcile_unix_secs: Arc::new(AtomicU64::new(0)),
             watcher_ok: Arc::new(AtomicBool::new(false)),
             is_running: Arc::new(AtomicBool::new(false)),
             watcher_handle: Arc::new(Mutex::new(None)),
             app_handle: Arc::new(RwLock::new(None)),
-        }
+            is_loaded,
+            start_indexing_pending,
+            data_dir: data_dir.to_path_buf(),
+        };
+
+        mgr.spawn_loader();
+        mgr
+    }
+
+    fn spawn_loader(&self) {
+        let metadata = Arc::clone(&self.metadata);
+        let content_index_arc = Arc::clone(&self.content_index);
+        let unit_store = Arc::clone(&self.unit_store);
+        let visual_store = Arc::clone(&self.visual_store);
+        let config_arc = Arc::clone(&self.config);
+        let status = Arc::clone(&self.status);
+        let is_loaded = Arc::clone(&self.is_loaded);
+        let start_indexing_pending = Arc::clone(&self.start_indexing_pending);
+        let app_handle = Arc::clone(&self.app_handle);
+        let query_in_flight = Arc::clone(&self.query_in_flight);
+        let is_running = Arc::clone(&self.is_running);
+        let watcher_handle = Arc::clone(&self.watcher_handle);
+        let crawl_start_unix_ms = Arc::clone(&self.crawl_start_unix_ms);
+        let last_reconcile_unix_secs = Arc::clone(&self.last_reconcile_unix_secs);
+        let watcher_ok = Arc::clone(&self.watcher_ok);
+        let embedding_queue = Arc::clone(&self.embedding_queue);
+        let data_dir = self.data_dir.clone();
+
+        std::thread::Builder::new()
+            .name("babbage-loader".to_string())
+            .spawn(move || {
+                let index_dir = data_dir.join("index");
+                let opened_content = match ContentIndex::new(&index_dir) {
+                    Ok(idx) => Some(idx),
+                    Err(e) => {
+                        crate::say_err!("[Babbage] Failed to create Tantivy index: {}", e);
+                        None
+                    }
+                };
+                let content_rebuilt = opened_content.as_ref().is_some_and(|index| index.rebuilt);
+                *content_index_arc.write() = opened_content;
+
+                let db = match MetadataDb::open_in_dir(&data_dir) {
+                    Ok(db) => Some(db),
+                    Err(e) => {
+                        crate::say_err!("[Babbage] Failed to open metadata DB in {}: {}", data_dir.display(), e);
+                        None
+                    }
+                };
+                let mut loaded_metadata = if let Some(db) = db {
+                    MetadataStore::with_db(db)
+                } else {
+                    MetadataStore::without_db()
+                };
+                let mut units_count = 0;
+
+                let semantic_enabled = config_arc.read().semantic_enabled;
+                if semantic_enabled && let Some(db) = loaded_metadata.db() {
+                    let expected_model_id = ModelRegistry::global().model_id;
+                    match db.units_model_id() {
+                        Ok(Some(existing_model_id)) if existing_model_id != expected_model_id => {
+                            match db.reset_semantic_index() {
+                                Ok(()) => {
+                                    unit_store.write().clear();
+                                    log::info!(
+                                        "[Babbage] Semantic model changed (units id {} -> {}); reset semantic index",
+                                        existing_model_id,
+                                        expected_model_id
+                                    );
+                                }
+                                Err(e) => {
+                                    crate::say_err!("[Babbage] Failed to reset semantic index: {}", e);
+                                }
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            crate::say_err!("[Babbage] Failed to read semantic model id: {}", e);
+                        }
+                    }
+                }
+
+                if let Some(db) = loaded_metadata.db() {
+                    let mut store = unit_store.write();
+                    match db.load_units_into(&mut store) {
+                        Ok(count) => {
+                            units_count = count;
+                            if units_count > 0 {
+                                crate::say!(
+                                    "[Babbage] Loaded {} semantic units from database",
+                                    units_count
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            crate::say_err!("[Babbage] Failed to load semantic units: {}", e);
+                        }
+                    }
+                    let mut vstore = visual_store.write();
+                    let _ = db.load_visual_units_into(&mut vstore);
+
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    db.run_maintenance_if_due(now);
+                }
+
+                if content_rebuilt {
+                    let marked = loaded_metadata.mark_all_content_pending();
+                    crate::say_err!(
+                        "[Babbage] Content index schema upgraded; {} file(s) queued for re-indexing",
+                        marked
+                    );
+                }
+
+                let files_count = loaded_metadata.len();
+                *metadata.write() = loaded_metadata;
+
+                is_loaded.store(true, Ordering::SeqCst);
+
+                {
+                    let mut st = status.write();
+                    st.files_indexed = files_count;
+                    st.units_indexed = units_count;
+                    st.semantic_ready = units_count > 0;
+                    st.current_status = "Idle".to_string();
+                    st.phase = "idle".to_string();
+                    IndexerManager::emit_status(&app_handle, &st);
+                }
+
+                let should_start = config_arc.read().is_setup_complete
+                    && start_indexing_pending.load(Ordering::SeqCst);
+                if should_start {
+                    let mgr = IndexerManager {
+                        metadata,
+                        content_index: content_index_arc,
+                        unit_store,
+                        visual_store,
+                        embedding_queue,
+                        query_in_flight,
+                        config: config_arc,
+                        status,
+                        crawl_start_unix_ms,
+                        last_reconcile_unix_secs,
+                        watcher_ok,
+                        is_running,
+                        watcher_handle,
+                        app_handle,
+                        is_loaded,
+                        start_indexing_pending,
+                        data_dir,
+                    };
+                    mgr.start_indexing();
+                }
+            })
+            .expect("spawn loader thread");
     }
 
     /// Read-only handle used by GUI clients that talk to a daemon. It loads the
     /// persisted metadata and Tantivy index without taking a writer lock or
     /// starting a watcher, so it can coexist with the daemon.
     pub fn new_readonly(config: BabbageConfig) -> Self {
+        Self::new_readonly_in(config, &BabbageConfig::config_dir())
+    }
+
+    pub fn new_readonly_in(config: BabbageConfig, data_dir: &Path) -> Self {
         crate::indexer::extract::set_external_extractors(config.extractors.clone());
         crate::indexer::extract::image::set_ocr_max_image_bytes(config.ocr_max_image_bytes);
         crate::indexer::extract::set_content_caps(config.content_max_file_size_mb, config.content_max_text_bytes);
         crate::embed::set_max_semantic_units(config.content_max_semantic_units);
-        let index_dir = BabbageConfig::index_dir();
-        let content_index = ContentIndex::open_read_only(&index_dir).ok();
-        let metadata_store = Arc::new(RwLock::new(MetadataStore::new()));
+
+        let metadata_store = Arc::new(RwLock::new(MetadataStore::without_db()));
+        let content_index = Arc::new(RwLock::new(None));
         let unit_store = Arc::new(RwLock::new(UnitStore::new(EMBEDDING_DIM)));
         let visual_store = Arc::new(RwLock::new(crate::embed::visual::VisualStore::new(
             crate::embed::visual::VISUAL_DIM,
             crate::embed::visual::MOCK_VISUAL_MODEL_ID,
         )));
         let query_in_flight = Arc::new(crate::util::pools::QueryFlag::new());
+        let is_loaded = Arc::new(AtomicBool::new(false));
+        let start_indexing_pending = Arc::new(AtomicBool::new(false));
 
-        let mut units_count = 0;
-        if let Some(db) = metadata_store.read().db() {
-            let mut store = unit_store.write();
-            if let Ok(count) = db.load_units_into(&mut store) {
-                units_count = count;
-            }
-            let mut vstore = visual_store.write();
-            let _ = db.load_visual_units_into(&mut vstore);
-        }
+        let status = Arc::new(RwLock::new(IndexingStatus {
+            is_indexing: false,
+            files_indexed: 0,
+            content_indexed: 0,
+            current_status: "Loading index...".to_string(),
+            is_embedding: false,
+            units_indexed: 0,
+            semantic_ready: false,
+            phase: "loading".to_string(),
+            total_files: 0,
+            extract_done: 0,
+            extract_total: 0,
+            paused: false,
+        }));
 
-        Self {
+        let mgr = Self {
             metadata: metadata_store,
-            content_index: Arc::new(RwLock::new(content_index)),
+            content_index,
             unit_store,
             visual_store,
             embedding_queue: Arc::new(Mutex::new(None)),
             query_in_flight,
             config: Arc::new(RwLock::new(config)),
-            status: Arc::new(RwLock::new(IndexingStatus {
-                is_indexing: false,
-                files_indexed: 0,
-                content_indexed: 0,
-                current_status: "Daemon-backed (read-only client)".to_string(),
-                is_embedding: false,
-                units_indexed: units_count,
-                semantic_ready: units_count > 0,
-                phase: "idle".to_string(),
-                total_files: 0,
-                extract_done: 0,
-                extract_total: 0,
-                paused: false,
-            })),
+            status,
             crawl_start_unix_ms: Arc::new(AtomicU64::new(0)),
             last_reconcile_unix_secs: Arc::new(AtomicU64::new(0)),
             watcher_ok: Arc::new(AtomicBool::new(false)),
             is_running: Arc::new(AtomicBool::new(false)),
             watcher_handle: Arc::new(Mutex::new(None)),
             app_handle: Arc::new(RwLock::new(None)),
+            is_loaded,
+            start_indexing_pending,
+            data_dir: data_dir.to_path_buf(),
+        };
+
+        mgr.spawn_readonly_loader();
+        mgr
+    }
+
+    fn spawn_readonly_loader(&self) {
+        let metadata = Arc::clone(&self.metadata);
+        let content_index_arc = Arc::clone(&self.content_index);
+        let unit_store = Arc::clone(&self.unit_store);
+        let visual_store = Arc::clone(&self.visual_store);
+        let status = Arc::clone(&self.status);
+        let is_loaded = Arc::clone(&self.is_loaded);
+        let app_handle = Arc::clone(&self.app_handle);
+        let data_dir = self.data_dir.clone();
+
+        std::thread::Builder::new()
+            .name("babbage-ro-loader".to_string())
+            .spawn(move || {
+                let index_dir = data_dir.join("index");
+                let opened_content = ContentIndex::open_read_only(&index_dir).ok();
+                *content_index_arc.write() = opened_content;
+
+                let db = MetadataDb::open_in_dir(&data_dir).ok();
+                let loaded_metadata = if let Some(db) = db {
+                    MetadataStore::with_db(db)
+                } else {
+                    MetadataStore::without_db()
+                };
+                let mut units_count = 0;
+                if let Some(db) = loaded_metadata.db() {
+                    let mut store = unit_store.write();
+                    if let Ok(count) = db.load_units_into(&mut store) {
+                        units_count = count;
+                    }
+                    let mut vstore = visual_store.write();
+                    let _ = db.load_visual_units_into(&mut vstore);
+                }
+                let files_count = loaded_metadata.len();
+                *metadata.write() = loaded_metadata;
+
+                is_loaded.store(true, Ordering::SeqCst);
+
+                {
+                    let mut st = status.write();
+                    st.files_indexed = files_count;
+                    st.units_indexed = units_count;
+                    st.semantic_ready = units_count > 0;
+                    st.current_status = "Daemon-backed (read-only client)".to_string();
+                    st.phase = "idle".to_string();
+                    IndexerManager::emit_status(&app_handle, &st);
+                }
+            })
+            .expect("spawn readonly loader thread");
+    }
+
+    pub fn is_loaded(&self) -> bool {
+        self.is_loaded.load(Ordering::SeqCst)
+    }
+
+    pub fn wait_for_load(&self) {
+        while !self.is_loaded.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(5));
         }
     }
 
     pub fn set_app_handle(&self, handle: tauri::AppHandle) {
         *self.app_handle.write() = Some(handle);
+        Self::emit_status(&self.app_handle, &self.status.read());
     }
 
     fn emit_status(app_handle: &Arc<RwLock<Option<tauri::AppHandle>>>, status: &IndexingStatus) {
@@ -596,6 +756,10 @@ impl IndexerManager {
     }
 
     pub fn start_indexing(&self) {
+        if !self.is_loaded.load(Ordering::SeqCst) {
+            self.start_indexing_pending.store(true, Ordering::SeqCst);
+            return;
+        }
         // Never crawl before the setup wizard has run: a fresh or corrupt
         // config falls back to the default roots (the home directory), and
         // scanning/watching those before the user has chosen their folders
@@ -2376,6 +2540,28 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].path, path2.to_string_lossy());
         assert!(results[0].similarity >= 0.99);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn manager_loads_in_background_and_reports_loading_status() {
+        let temp_dir = std::env::temp_dir().join(format!("babbage-mgr-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let config = BabbageConfig {
+            is_setup_complete: false,
+            ..BabbageConfig::default()
+        };
+        let manager = IndexerManager::new_in(config, &temp_dir);
+        let st_initial = manager.get_status();
+        assert!(st_initial.phase == "loading" || manager.is_loaded());
+
+        manager.wait_for_load();
+        assert!(manager.is_loaded());
+        let st_loaded = manager.get_status();
+        assert_eq!(st_loaded.phase, "idle");
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

@@ -189,6 +189,17 @@ pub async fn search(
     }
 
     let indexer = std::sync::Arc::clone(&state.indexer);
+    if !indexer.is_loaded() {
+        record_query_latency(started.elapsed().as_micros() as u64);
+        return Ok(SearchResponse {
+            seq: req_seq,
+            results: Vec::new(),
+            total: 0,
+            mode: "ranked".to_string(),
+            ..SearchResponse::default()
+        });
+    }
+
     // CPU-bound: run on a blocking thread, not an async-runtime worker, and
     // inside the dedicated query pool so the crawl can never hold it.
     let resp = tauri::async_runtime::spawn_blocking(move || {
@@ -306,6 +317,9 @@ pub async fn legacy_search(
     }
 
     let indexer = &state.indexer;
+    if !indexer.is_loaded() {
+        return Ok(Vec::new());
+    }
     let _in_flight = indexer.query_in_flight.enter();
 
     let metadata = indexer.metadata.read();

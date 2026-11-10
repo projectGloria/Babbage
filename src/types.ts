@@ -143,6 +143,7 @@ export interface IndexingStatus {
   semantic_ready?: boolean;
   phase?:
     | "idle"
+    | "loading"
     | "rebuilding"
     | "walking"
     | "extracting"

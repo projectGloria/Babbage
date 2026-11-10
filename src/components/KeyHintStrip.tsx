@@ -25,6 +25,7 @@ function statusText(
   if (!s) return { text: "", busy: false };
   if (s.paused) return { text: t("status.paused"), busy: false };
   if (s.is_indexing || (s.phase && s.phase !== "idle")) {
+    if (s.phase === "loading") return { text: t("status.loading"), busy: true };
     if (s.phase === "rebuilding") return { text: t("status.rebuilding"), busy: true };
     /* Background semantic embedding runs after the crawl. Showing it as
        "Indexing N of N" (the finished crawl's counts) looked stuck. */
