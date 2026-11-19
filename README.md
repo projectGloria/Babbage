@@ -11,7 +11,7 @@
 <p align="center">
   <a href="https://github.com/projectGloria/Babbage/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/projectGloria/Babbage/ci.yml?branch=main&style=for-the-badge&label=CI" /></a>
   <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-1d1d1f?style=for-the-badge" /></a>
-  <img alt="Version 1.0.16" src="https://img.shields.io/badge/version-1.0.16-1d1d1f?style=for-the-badge" />
+  <img alt="Version 1.1.1" src="https://img.shields.io/badge/version-1.1.1-1d1d1f?style=for-the-badge" />
   <img alt="Platforms: Windows, macOS, Linux" src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-1d1d1f?style=for-the-badge" />
   <img alt="100% Local & Offline" src="https://img.shields.io/badge/privacy-100%25%20local-248a3d?style=for-the-badge" />
 </p>

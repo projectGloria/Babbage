@@ -1,0 +1,262 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v1.1.1). Defaults to v<version from package.json>.'
+        required: false
+        type: string
+      draft:
+        description: 'Create release as a draft'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Must match the ONNX Runtime API version expected by `ort` in src-tauri/Cargo.toml.
+  ONNXRUNTIME_VERSION: '1.31.0'
+  NUGET_ORT_URL: 'https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/1.31.0/microsoft.ml.onnxruntime.1.31.0.nupkg'
+
+jobs:
+  build:
+    name: Build (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-x64
+            os: ubuntu-22.04
+            platform: linux
+            arch: x64
+            rust_target: x86_64-unknown-linux-gnu
+            rust_targets: ''
+            ort_rid: linux-x64
+            ort_lib: libonnxruntime.so
+            ort_config: src-tauri/tauri.onnxruntime.linux.conf.json
+            tauri_args: '--config src-tauri/tauri.onnxruntime.linux.conf.json'
+            bundle_dir: src-tauri/target/release/bundle
+            cli_name: babbage-cli-linux-x86_64
+
+          - label: macos-universal
+            os: macos-latest
+            platform: macos
+            arch: universal
+            rust_target: universal-apple-darwin
+            rust_targets: 'aarch64-apple-darwin,x86_64-apple-darwin'
+            ort_rid: osx-arm64
+            ort_lib: libonnxruntime.dylib
+            ort_config: src-tauri/tauri.onnxruntime.macos.conf.json
+            tauri_args: '--target universal-apple-darwin --config src-tauri/tauri.onnxruntime.macos.conf.json'
+            bundle_dir: src-tauri/target/universal-apple-darwin/release/bundle
+            cli_name: babbage-cli-macos-arm64
+
+          - label: windows-x64
+            os: windows-latest
+            platform: windows
+            arch: x64
+            rust_target: x86_64-pc-windows-msvc
+            rust_targets: ''
+            ort_rid: win-x64
+            ort_lib: onnxruntime.dll
+            ort_config: src-tauri/tauri.onnxruntime.windows.conf.json
+            tauri_args: '--target x86_64-pc-windows-msvc --config src-tauri/tauri.onnxruntime.windows.conf.json'
+            bundle_dir: src-tauri/target/x86_64-pc-windows-msvc/release/bundle
+            cli_name: babbage-cli-windows-x86_64.exe
+
+          - label: windows-arm64
+            os: windows-11-arm
+            platform: windows
+            arch: arm64
+            rust_target: aarch64-pc-windows-msvc
+            rust_targets: ''
+            ort_rid: win-arm64
+            ort_lib: onnxruntime.dll
+            ort_config: src-tauri/tauri.onnxruntime.windows.conf.json
+            tauri_args: '--target aarch64-pc-windows-msvc --config src-tauri/tauri.onnxruntime.windows.conf.json'
+            bundle_dir: src-tauri/target/aarch64-pc-windows-msvc/release/bundle
+            cli_name: babbage-cli-windows-aarch64.exe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux Tauri and bundler dependencies
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libgtk-3-dev \
+            patchelf \
+            rpm \
+            libfuse2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_targets }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            src-tauri -> target
+            cli -> target
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Fetch ONNX Runtime shared library (Unix)
+        if: matrix.platform != 'windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL "$NUGET_ORT_URL" -o /tmp/ort.nupkg
+          unzip -j -o /tmp/ort.nupkg "runtimes/${{ matrix.ort_rid }}/native/${{ matrix.ort_lib }}" -d src-tauri/
+          rm -f /tmp/ort.nupkg
+          ls -lh "src-tauri/${{ matrix.ort_lib }}"
+
+      - name: Fetch ONNX Runtime shared library (Windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $nupkg = Join-Path $env:TEMP 'ort.nupkg'
+          Invoke-WebRequest -Uri $env:NUGET_ORT_URL -OutFile $nupkg
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [System.IO.Compression.ZipFile]::OpenRead($nupkg)
+          try {
+            $entryPath = "runtimes/${{ matrix.ort_rid }}/native/${{ matrix.ort_lib }}"
+            $entry = $zip.GetEntry($entryPath)
+            if (-not $entry) { throw "Missing entry $entryPath in ONNX Runtime package" }
+            $dest = Join-Path (Resolve-Path 'src-tauri') '${{ matrix.ort_lib }}'
+            [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $dest, $true)
+          } finally {
+            $zip.Dispose()
+            Remove-Item -Force $nupkg
+          }
+          Get-Item "src-tauri/${{ matrix.ort_lib }}"
+
+      # Signing / notarization (optional — add repository secrets to enable):
+      #   macOS: APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY,
+      #          APPLE_ID, APPLE_PASSWORD, APPLE_TEAM_ID
+      #   Windows: WINDOWS_CERTIFICATE, WINDOWS_CERTIFICATE_PASSWORD
+      - name: Build Tauri installers
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: '1'
+        run: npx tauri build ${{ matrix.tauri_args }}
+
+      - name: Build agent CLI
+        run: cargo build --release --manifest-path cli/Cargo.toml --bin babbage-cli
+
+      - name: Collect release assets (Linux)
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          cp ${{ matrix.bundle_dir }}/deb/*.deb release-assets/
+          cp ${{ matrix.bundle_dir }}/rpm/*.rpm release-assets/
+          cp ${{ matrix.bundle_dir }}/appimage/*.AppImage release-assets/
+          cp cli/target/release/babbage-cli "release-assets/${{ matrix.cli_name }}"
+          ls -lh release-assets/
+
+      - name: Collect release assets (macOS)
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          cp ${{ matrix.bundle_dir }}/dmg/*.dmg release-assets/
+          cp cli/target/release/babbage-cli "release-assets/${{ matrix.cli_name }}"
+          ls -lh release-assets/
+
+      - name: Collect release assets and portable zip (Windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          New-Item -ItemType Directory -Force -Path release-assets | Out-Null
+
+          Copy-Item "${{ matrix.bundle_dir }}/nsis/*.exe" release-assets/
+          Copy-Item "${{ matrix.bundle_dir }}/msi/*.msi" release-assets/
+          Copy-Item "cli/target/release/babbage-cli.exe" "release-assets/${{ matrix.cli_name }}"
+
+          $portableDir = Join-Path $env:TEMP "babbage-portable-$version-${{ matrix.arch }}"
+          if (Test-Path $portableDir) { Remove-Item -Recurse -Force $portableDir }
+          New-Item -ItemType Directory -Force -Path $portableDir | Out-Null
+          Copy-Item "src-tauri/target/${{ matrix.rust_target }}/release/babbage.exe" $portableDir/
+          Copy-Item "src-tauri/${{ matrix.ort_lib }}" $portableDir/
+          Copy-Item -Recurse "src-tauri/resources" "$portableDir/resources"
+          Compress-Archive -Path "$portableDir/*" -DestinationPath "release-assets/babbage-portable-$version-${{ matrix.arch }}.zip" -Force
+
+          Get-ChildItem release-assets/
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: babbage-${{ matrix.label }}
+          path: release-assets/*
+          if-no-files-found: error
+
+  publish:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve release tag
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            TAG="${{ github.ref_name }}"
+          elif [[ -n "${{ inputs.tag }}" ]]; then
+            TAG="${{ inputs.tag }}"
+          else
+            VERSION=$(node -p "require('./package.json').version")
+            TAG="v${VERSION}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist-assets
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist-assets
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: Babbage ${{ steps.meta.outputs.tag }}
+          draft: ${{ inputs.draft || false }}
+          generate_release_notes: true
+          files: dist-assets/*
