@@ -13,8 +13,8 @@ Thanks for helping. Bug reports, docs fixes, and focused PRs are all welcome.
 ## Setup
 
 ```bash
-git clone https://github.com/yjid/babbage
-cd babbage
+git clone https://github.com/projectGloria/Babbage.git
+cd Babbage
 bun install
 bun run tauri dev
 ```

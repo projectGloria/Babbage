@@ -2,7 +2,7 @@
 
 ## Prebuilt bundles
 
-Download from [Releases](https://github.com/yjid/babbage/releases).
+Download from [Releases](https://github.com/projectGloria/Babbage/releases).
 
 | Platform | Asset | Notes |
 |---|---|---|
@@ -83,8 +83,8 @@ xcode-select --install
 ## Build
 
 ```bash
-git clone https://github.com/yjid/babbage
-cd babbage
+git clone https://github.com/projectGloria/Babbage.git
+cd Babbage
 bun install
 
 bun run tauri dev        # dev app
