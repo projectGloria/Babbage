@@ -47,7 +47,7 @@ pub fn request(method: &str, mut params: Value) -> Result<Value, String> {
     use std::io::{BufRead, BufReader, Write};
     use std::time::Duration;
 
-    if std::env::var_os("BABBAGE_NO_DAEMON").is_some() || std::env::var_os("BABBAGE_NO_DAEMON").is_some() {
+    if std::env::var_os("BABBAGE_NO_DAEMON").is_some() {
         return Err("daemon disabled by BABBAGE_NO_DAEMON".to_string());
     }
     let token = read_token().ok_or_else(|| "daemon token missing".to_string())?;
@@ -338,6 +338,11 @@ impl DaemonClient {
     /// the app's own UI, not from an agent.
     pub fn rescan(&self) -> Result<(), String> {
         request("rescan", serde_json::json!({}))?;
+        Ok(())
+    }
+
+    pub fn reembed_all(&self) -> Result<(), String> {
+        request("reembed_all", serde_json::json!({}))?;
         Ok(())
     }
 }

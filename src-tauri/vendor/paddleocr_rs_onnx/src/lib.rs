@@ -401,6 +401,19 @@ fn configure_session_builder(
     }
 }
 
+fn build_session(
+    model: &[u8],
+    device: AccelerationDevice,
+    intra_threads: usize,
+) -> Result<ort::session::Session, PaddleOcrError> {
+    let mut builder = configure_session_builder(session_builder()?, device)?
+        .with_intra_threads(intra_threads)
+        .map_err(|e| PaddleOcrError::General(format!("ONNX intra-threads config failed: {e}")))?
+        .with_inter_threads(1)
+        .map_err(|e| PaddleOcrError::General(format!("ONNX inter-threads config failed: {e}")))?;
+    Ok(builder.commit_from_memory(model)?)
+}
+
 /// The main OCR engine combining text detection and recognition.
 ///
 /// `OcrEngine` manages ONNX sessions for both the detection model (DBNet) and
@@ -521,10 +534,8 @@ impl OcrEngine {
     ) -> Result<Self, PaddleOcrError> {
         info!("[ocr] creating engine with device: {}", device);
 
-        let det_session = configure_session_builder(session_builder()?, device)?
-            .commit_from_memory(det_model)?;
-        let rec_session = configure_session_builder(session_builder()?, device)?
-            .commit_from_memory(rec_model)?;
+        let det_session = build_session(det_model, device, 2)?;
+        let rec_session = build_session(rec_model, device, 1)?;
 
         let det_input = det_session.inputs()[0].name().to_string();
         let det_output = det_session.outputs()[0].name().to_string();
@@ -584,10 +595,7 @@ impl OcrEngine {
         let mut sessions = VecDeque::with_capacity(pool_size);
         sessions.push_back(rec_session);
         for _ in 1..pool_size {
-            sessions.push_back(
-                configure_session_builder(session_builder()?, device)?
-                    .commit_from_memory(rec_model)?,
-            );
+            sessions.push_back(build_session(rec_model, device, 1)?);
         }
 
         Ok(Self {
@@ -692,30 +700,53 @@ impl OcrEngine {
     /// [`detect_text_regions`]: OcrEngine::detect_text_regions
     /// [`recognize_all`]: OcrEngine::recognize_all
     pub fn recognize_text(&self, image: &DynamicImage, region: &TextRegion) -> Result<decode::DecodedText, PaddleOcrError> {
-        let (data, width) = rec::preprocess_region(image, region, self.rec_height, self.rec_width)?;
+        let rgb = image.to_rgb8();
+        self.recognize_text_rgb(&rgb, region)
+    }
 
-        // Pop a session from the pool, blocking until one is available
-        let mut session = {
-            let mut pool = self.rec_sessions.lock();
-            loop {
-                if let Some(s) = pool.pop_front() {
-                    break s;
+    fn recognize_text_rgb(&self, rgb: &image::RgbImage, region: &TextRegion) -> Result<decode::DecodedText, PaddleOcrError> {
+        let (data, width) = rec::preprocess_region_rgb(rgb, region, self.rec_height, self.rec_width)?;
+
+        struct SessionLease<'a> {
+            engine: &'a OcrEngine,
+            session: Option<ort::session::Session>,
+        }
+        impl<'a> Drop for SessionLease<'a> {
+            fn drop(&mut self) {
+                if let Some(s) = self.session.take() {
+                    let mut pool = self.engine.rec_sessions.lock();
+                    pool.push_back(s);
+                    self.engine.rec_sessions_cvar.notify_one();
                 }
-                self.rec_sessions_cvar.wait(&mut pool);
             }
-        };
-
-        let result = rec::run_recognition(&mut session, &data, width, self.rec_height, &self.rec_input, &self.rec_output)?;
-
-        // Always return session to pool and notify waiters
-        {
-            let mut pool = self.rec_sessions.lock();
-            pool.push_back(session);
-            self.rec_sessions_cvar.notify_one();
         }
 
-        let probs = result;
-        Ok(decode::ctc_decode(&probs, &self.keys))
+        // Pop a session from the pool, blocking until one is available; the lease
+        // returns it on drop even if inference returns an error or panics.
+        let mut lease = SessionLease {
+            engine: self,
+            session: Some({
+                let mut pool = self.rec_sessions.lock();
+                loop {
+                    if let Some(s) = pool.pop_front() {
+                        break s;
+                    }
+                    self.rec_sessions_cvar.wait(&mut pool);
+                }
+            }),
+        };
+
+        let result = rec::run_recognition(
+            lease.session.as_mut().expect("session held by lease"),
+            &data,
+            width,
+            self.rec_height,
+            &self.rec_input,
+            &self.rec_output,
+        )?;
+        drop(lease);
+
+        Ok(decode::ctc_decode(&result, &self.keys))
     }
 
     /// Complete OCR pipeline: detection + recognition.
@@ -776,10 +807,11 @@ impl OcrEngine {
                 .map_err(|e| PaddleOcrError::General(e.to_string()));
         }
 
+        let rgb = image.to_rgb8();
         let mut blocks: Vec<OcrBlock> = regions
             .par_iter()
             .filter_map(|region| {
-                match self.recognize_text(image, region) {
+                match self.recognize_text_rgb(&rgb, region) {
                     Ok(decoded) => {
                         if decoded.text.is_empty() {
                             None
@@ -806,25 +838,13 @@ impl OcrEngine {
 
         match order {
             OrderBy::Horizontal => {
-                blocks.sort_by(|a, b| {
-                    a.y.partial_cmp(&b.y)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then_with(|| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal))
-                });
+                blocks.sort_by(|a, b| a.y.total_cmp(&b.y).then_with(|| a.x.total_cmp(&b.x)));
             }
             OrderBy::Vertical => {
-                blocks.sort_by(|a, b| {
-                    a.x.partial_cmp(&b.x)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then_with(|| a.y.partial_cmp(&b.y).unwrap_or(std::cmp::Ordering::Equal))
-                });
+                blocks.sort_by(|a, b| a.x.total_cmp(&b.x).then_with(|| a.y.total_cmp(&b.y)));
             }
             OrderBy::Score => {
-                blocks.sort_by(|a, b| {
-                    b.confidence
-                        .partial_cmp(&a.confidence)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
+                blocks.sort_by(|a, b| b.confidence.total_cmp(&a.confidence));
             }
         }
 
@@ -961,8 +981,7 @@ impl DocOrientationClassifier {
     pub fn new_with_device(model_data: &[u8], device: AccelerationDevice) -> Result<Self, PaddleOcrError> {
         info!("[doc_ori] creating classifier with device: {}", device);
 
-        let session = configure_session_builder(session_builder()?, device)?
-            .commit_from_memory(model_data)?;
+        let session = build_session(model_data, device, 1)?;
 
         let input_name = session.inputs()[0].name().to_string();
         let output_name = session.outputs()[0].name().to_string();

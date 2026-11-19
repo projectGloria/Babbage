@@ -174,31 +174,56 @@ pub fn self_test() -> Result<(), String> {
 mod pool {
     use super::engine::Engine;
     use super::imageops::Gray;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{Condvar, Mutex, OnceLock};
 
-    /// Threads per engine; engines = half the cores / this, at most 3.
+    /// Threads per engine; capped to avoid duplicating 7 ONNX models excessively.
     const THREADS: usize = 2;
+
+    struct EnginePool {
+        engines: Mutex<Vec<Engine>>,
+        cvar: Condvar,
+    }
+
+    struct EngineLease<'a> {
+        pool: &'a EnginePool,
+        engine: Option<Engine>,
+    }
+
+    impl<'a> Drop for EngineLease<'a> {
+        fn drop(&mut self) {
+            if let Some(engine) = self.engine.take() {
+                let mut guard = self
+                    .pool
+                    .engines
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                guard.push(engine);
+                self.pool.cvar.notify_one();
+            }
+        }
+    }
 
     /// `None` once loading failed: a corrupt pack is probed once, not once
     /// per image.
-    static ENGINES: OnceLock<Option<Vec<Mutex<Engine>>>> = OnceLock::new();
-    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    static POOL: OnceLock<Option<EnginePool>> = OnceLock::new();
 
-    fn load() -> Option<Vec<Mutex<Engine>>> {
+    fn load() -> Option<EnginePool> {
         let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
-        let count = (cores / 2 / THREADS).clamp(1, 4);
+        let count = (cores / 2 / THREADS).clamp(1, 2);
         // `ort` can panic instead of erroring when the runtime is broken.
         let loaded = std::panic::catch_unwind(|| {
             // One ONNX Runtime environment per process: share PP-OCR's.
             let env = paddleocr_rs_onnx::shared_environment().map_err(|e| e.to_string())?;
             let dir = super::pack_dir();
             (0..count)
-                .map(|_| Engine::load(&env, &dir, THREADS).map(Mutex::new))
+                .map(|_| Engine::load(&env, &dir, THREADS))
                 .collect::<Result<Vec<_>, String>>()
         });
         match loaded {
-            Ok(Ok(engines)) => Some(engines),
+            Ok(Ok(engines)) => Some(EnginePool {
+                engines: Mutex::new(engines),
+                cvar: Condvar::new(),
+            }),
             Ok(Err(e)) => {
                 eprintln!("[Babbage OCR] Indra models failed to load: {e}");
                 None
@@ -212,25 +237,29 @@ mod pool {
 
     /// `None` when no engine could load.
     pub fn read(page: &Gray) -> Option<Result<String, String>> {
-        let engines = ENGINES.get_or_init(load).as_ref()?;
-        let start = NEXT.fetch_add(1, Ordering::Relaxed);
-        let mut attempts = 0;
-        let mut engine = loop {
-            let offset = (start + attempts) % engines.len();
-            if let Some(guard) = (0..engines.len())
-                .find_map(|i| engines[(offset + i) % engines.len()].try_lock().ok())
-            {
-                break guard;
-            }
-            attempts += 1;
-            if attempts > 300 {
-                break engines[start % engines.len()]
-                    .lock()
+        let pool = POOL.get_or_init(load).as_ref()?;
+        let engine = {
+            let mut guard = pool
+                .engines
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            loop {
+                if let Some(e) = guard.pop() {
+                    break e;
+                }
+                guard = pool
+                    .cvar
+                    .wait(guard)
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
         };
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| engine.read(page)));
+        let mut lease = EngineLease {
+            pool,
+            engine: Some(engine),
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            lease.engine.as_mut().expect("engine held by lease").read(page)
+        }));
         Some(result.unwrap_or_else(|_| Err("the engine panicked".into())))
     }
 }

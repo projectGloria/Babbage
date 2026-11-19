@@ -217,7 +217,10 @@ impl VisualStore {
 
 /// Preprocesses any dynamic image into 224x224 RGB planar float tensor [1, 3, 224, 224].
 pub fn preprocess_image(img: &DynamicImage) -> Vec<f32> {
-    let resized = img.resize_exact(224, 224, FilterType::Triangle).to_rgb8();
+    let resized = crate::indexer::extract::image::to_rgb8_composited(
+        &img.resize_exact(224, 224, FilterType::Triangle),
+        [255, 255, 255],
+    );
     let num_pixels = 224 * 224;
     let mut tensor = vec![0.0f32; 3 * num_pixels];
 

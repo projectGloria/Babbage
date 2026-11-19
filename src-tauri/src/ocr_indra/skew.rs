@@ -15,6 +15,9 @@ pub const DESKEW_MIN: f64 = 0.3;
 /// bilinear sampling. `replicate`: edge pixels fill the corners (a page);
 /// otherwise 0 (an ink map).
 pub fn rotate(gray: &Gray, degrees: f64, replicate: bool) -> Gray {
+    if degrees.abs() < 1e-6 {
+        return gray.clone();
+    }
     let (sin, cos) = degrees.to_radians().sin_cos();
     let (cx, cy) = (gray.w as f64 / 2.0, gray.h as f64 / 2.0);
     let (wm, hm) = (gray.w as i64 - 1, gray.h as i64 - 1);
@@ -58,12 +61,45 @@ fn ink_thumb(gray: &Gray, side: usize) -> Gray {
 }
 
 fn row_sharpness(ink: &Gray, degrees: f64) -> f64 {
-    let turned = rotate(ink, degrees, false);
-    let rows: Vec<f64> = turned
-        .data
-        .chunks(turned.w)
-        .map(|row| row.iter().map(|&v| v as u64).sum::<u64>() as f64)
-        .collect();
+    if ink.h < 2 || ink.w == 0 {
+        return 0.0;
+    }
+    if degrees.abs() < 1e-6 {
+        let rows: Vec<f64> = ink
+            .data
+            .chunks(ink.w)
+            .map(|row| row.iter().map(|&v| v as u64).sum::<u64>() as f64)
+            .collect();
+        return rows.windows(2).map(|p| (p[1] - p[0]).powi(2)).sum();
+    }
+
+    // Forward-project non-zero ink pixels onto output rows with linear split,
+    // avoiding full-page buffer allocation across 84 search angles.
+    let (sin, cos) = degrees.to_radians().sin_cos();
+    let (cx, cy) = (ink.w as f64 / 2.0, ink.h as f64 / 2.0);
+    let mut rows = vec![0.0f64; ink.h];
+    for (y, row) in ink.data.chunks(ink.w).enumerate() {
+        let dy = y as f64 - cy;
+        let base_y = cos * dy + cy;
+        for (x, &val) in row.iter().enumerate() {
+            if val == 0 {
+                continue;
+            }
+            let dx = x as f64 - cx;
+            // Inverse of rotate()'s sy = sin * dx + cos * dy + cy
+            let oy = -sin * dx + base_y;
+            let y0 = oy.floor() as isize;
+            let fy = oy - y0 as f64;
+            let v = val as f64;
+            if y0 >= 0 && (y0 as usize) < ink.h {
+                rows[y0 as usize] += v * (1.0 - fy);
+            }
+            let y1 = y0 + 1;
+            if y1 >= 0 && (y1 as usize) < ink.h {
+                rows[y1 as usize] += v * fy;
+            }
+        }
+    }
     rows.windows(2).map(|p| (p[1] - p[0]).powi(2)).sum()
 }
 

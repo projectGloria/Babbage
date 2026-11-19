@@ -3,7 +3,7 @@ import { useTranslation } from "react-i18next";
 import { SearchResult } from "../types";
 import { HighlightedName } from "./EmptyState";
 import { isThumbImage, useThumbnail } from "../lib/thumbnails";
-import { formatBytes, formatRelativeTime } from "../lib/format";
+import { fileUri, formatBytes, formatRelativeTime } from "../lib/format";
 import { HoverDetails } from "./HoverDetails";
 import { TypeTile } from "./TypeTile";
 
@@ -44,6 +44,7 @@ export const ResultItem = React.memo<ResultItemProps>(
     return (
       <button
         type="button"
+        role="option"
         onClick={onSelect}
         onDoubleClick={onOpen}
         onMouseEnter={() => setHovered(true)}
@@ -64,7 +65,7 @@ export const ResultItem = React.memo<ResultItemProps>(
         onDragStart={(e) => {
           e.dataTransfer.effectAllowed = "copy";
           e.dataTransfer.setData("text/plain", result.path);
-          e.dataTransfer.setData("text/uri-list", `file://${result.path}`);
+          e.dataTransfer.setData("text/uri-list", fileUri(result.path));
         }}
         aria-selected={isSelected}
         title={result.path}

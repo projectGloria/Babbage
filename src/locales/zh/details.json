@@ -11,6 +11,7 @@
     "content": "文件内容",
     "contentFolded": "内容（模糊）",
     "semantic": "语义",
+    "visual": "图像相似度",
     "both": "文件名和内容"
   },
   "preview": {

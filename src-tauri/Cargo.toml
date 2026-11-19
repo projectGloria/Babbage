@@ -8,7 +8,7 @@ edition = "2024"
 
 [lib]
 name = "babbage_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+crate-type = ["rlib"]
 
 
 
@@ -41,7 +41,7 @@ lopdf = "0.46.0"
 quick-xml = "0.42.0"
 zip = "9.1.0"
 ureq = { version = "2", features = ["tls", "json"] }
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp", "tiff"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp", "tiff", "ico"] }
 paddleocr_rs_onnx = { version = "0.2.8", default-features = false, optional = true }
 # `load-dynamic`: the prebuilt static onnxruntime archive is compiled
 # against glibc 2.38+ and cannot link on older toolchains (this broke CI's

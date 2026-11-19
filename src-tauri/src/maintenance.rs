@@ -40,24 +40,7 @@ pub struct DataInventory {
     pub update_temp_bytes: u64,
 }
 
-fn dir_size(path: &Path) -> u64 {
-    let entries = match std::fs::read_dir(path) {
-        Ok(entries) => entries,
-        Err(_) => return 0,
-    };
-    let mut total = 0u64;
-    for entry in entries.flatten() {
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if file_type.is_dir() {
-            total += dir_size(&entry.path());
-        } else if let Ok(meta) = entry.metadata() {
-            total += meta.len();
-        }
-    }
-    total
-}
+use crate::util::dir_size_bytes as dir_size;
 
 fn file_size(path: &Path) -> u64 {
     std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)

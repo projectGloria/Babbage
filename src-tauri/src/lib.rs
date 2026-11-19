@@ -31,6 +31,7 @@ use tauri::{
 };
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
+#[derive(Clone)]
 pub struct AppState {
     pub indexer: Arc<IndexerManager>,
     pub daemon: Option<crate::daemon::DaemonClient>,
@@ -278,11 +279,32 @@ fn apply_pending_rebuild_in(dir: &std::path::Path) -> bool {
     if !marker.exists() {
         return false;
     }
-    // Keep settings (config.json); wipe only the index and metadata.
-    let _ = std::fs::remove_dir_all(dir.join("index"));
-    let _ = std::fs::remove_dir_all(dir.join("thumbs"));
-    for name in ["metadata.db", "metadata.db-wal", "metadata.db-shm"] {
-        let _ = std::fs::remove_file(dir.join(name));
+    // Keep settings (config.json); wipe only the index and metadata, retrying
+    // briefly on Windows if the exiting process still holds an open map.
+    let result = reset_with_retries(RESET_ATTEMPTS, RESET_RETRY, || {
+        for sub in ["index", "thumbs"] {
+            let p = dir.join(sub);
+            if p.exists() {
+                std::fs::remove_dir_all(&p)
+                    .map_err(|e| format!("{}: {}", p.display(), e))?;
+            }
+        }
+        for name in ["metadata.db", "metadata.db-wal", "metadata.db-shm"] {
+            let p = dir.join(name);
+            if p.exists() {
+                std::fs::remove_file(&p)
+                    .map_err(|e| format!("{}: {}", p.display(), e))?;
+            }
+        }
+        Ok(())
+    });
+    if let Err(e) = result {
+        eprintln!(
+            "[Babbage] Rebuild requested but could not clear everything in {}: {}",
+            dir.display(),
+            e
+        );
+        return true;
     }
     let _ = std::fs::remove_file(&marker);
     eprintln!("[Babbage] Rebuild requested: index cleared in {}", dir.display());
@@ -333,6 +355,14 @@ pub fn run() {
     }
 
     commands::init_process_start();
+
+    // Acquire the single-instance lock before running any destructive startup
+    // steps (asset extraction, pending reset/rebuild, cleanup, or spawning daemon).
+    let instance_lock = acquire_instance_lock_or_exit();
+    if let Some(file) = instance_lock {
+        let _ = INSTANCE_LOCK.set(std::sync::Mutex::new(Some(file)));
+    }
+
     models::ensure_bundled_assets();
 
     maybe_apply_pending_rebuild();
@@ -361,14 +391,6 @@ pub fn run() {
     let daemon_available = crate::daemon::DaemonClient::ensure();
     #[cfg(not(unix))]
     let daemon_available = false;
-
-    // The GUI always takes its own lock, daemon or not. The daemon lock is a
-    // different file: it guards the index owner, not the window.
-    let instance_lock = acquire_instance_lock_or_exit();
-
-    if let Some(file) = instance_lock {
-        let _ = INSTANCE_LOCK.set(std::sync::Mutex::new(Some(file)));
-    }
 
     let config = BabbageConfig::load();
     crashlog::info(&format!(
@@ -525,6 +547,8 @@ pub fn run() {
             commands::run_doctor,
             commands::reset_all,
             commands::rebuild_index,
+            commands::reindex,
+            commands::reembed_all,
             commands::run_doctor_action,
             commands::get_reset_pending,
             commands::get_autostart,
@@ -641,7 +665,12 @@ pub fn run() {
                     loop {
                         std::thread::sleep(std::time::Duration::from_millis(500));
                         let state = handle.state::<AppState>();
-                        let busy = {
+                        let busy = if let Some(daemon) = state.daemon.as_ref() {
+                            daemon
+                                .get_status()
+                                .map(|st| st.is_indexing || st.is_embedding)
+                                .unwrap_or(false)
+                        } else {
                             let st = state.indexer.status.read();
                             st.is_indexing || st.is_embedding
                         } || tray_icon::searching();

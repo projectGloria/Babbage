@@ -43,7 +43,7 @@ import { FileRow } from "./components/FileRow";
 import { normalizeTheme } from "./hooks/useTheme";
 import { useLanguage } from "./hooks/useLanguage";
 import { PreviewDialog } from "./components/PreviewDialog";
-import { classify } from "./lib/categories";
+import { matchesCategory } from "./lib/categories";
 import { useMeasuredHeight } from "./lib/useMeasuredHeight";
 import { interpretationLabel } from "./lib/interpretation";
 import { inFilter } from "./lib/query";
@@ -126,6 +126,9 @@ function App() {
     };
   }, []);
   const [results, setResults] = useState<SearchResult[]>([]);
+  const resultsRef = useRef(results);
+  resultsRef.current = results;
+  const displayResultsRef = useRef<SearchResult[]>([]);
   const [total, setTotal] = useState(0);
   const [activeFilters, setActiveFilters] = useState<ActiveFilter[]>([]);
   const [hints, setHints] = useState<string[]>([]);
@@ -215,22 +218,7 @@ function App() {
    *  Only `data-index` cells count — full-span labels ("Recent") sit in
    *  the grid too but span every column. */
   const columnsRef = useRef(1);
-  const gridColumnCount = useCallback(() => {
-    if (columnsRef.current > 0) return columnsRef.current;
-    const el = resultsContainerRef.current;
-    if (!el) return 1;
-    const children = Array.from(el.children).filter((child) =>
-      child.hasAttribute("data-index"),
-    ) as HTMLElement[];
-    if (children.length === 0) return 1;
-    const firstTop = children[0].offsetTop;
-    let count = 0;
-    for (const child of children) {
-      if (child.offsetTop !== firstTop) break;
-      count += 1;
-    }
-    return Math.max(1, count);
-  }, []);
+  const gridColumnCount = useCallback(() => Math.max(1, columnsRef.current), []);
   const currentSeqRef = useRef(0);
   /* The query the rows on screen were produced for. Kept apart from `query`
      so a keypress during the debounce window cannot act on a stale row. */
@@ -396,121 +384,6 @@ function App() {
     return () => clearTimeout(timer);
   }, [query, results.length, recordQuery]);
 
-  // Fetch snippets only for rows that are actually visible (or the first 20
-  // when IntersectionObserver is unavailable). Results are patched by path
-  // and stale responses for superseded queries are discarded.
-  useEffect(() => {
-    if (!isSetupComplete || results.length === 0) return;
-    const container = resultsContainerRef.current;
-    if (!container) return;
-
-    const seq = currentSeqRef.current;
-    const q = query;
-    const pending = new Set<string>();
-
-    const flush = () => {
-      const paths = Array.from(pending).slice(0, 20);
-      pending.clear();
-      if (paths.length === 0) return;
-      invoke<SnippetDto[]>("get_snippets", { paths, query: q })
-        .then((dtos) => {
-          if (seq !== currentSeqRef.current || queryRef.current !== q) return;
-          if (!Array.isArray(dtos)) return;
-          const patch = new Set<string>();
-          for (const dto of dtos) {
-            if (dto && typeof dto.path === "string") {
-              const result = results.find((r) => r.path === dto.path);
-              const key = `${dto.path}\u0000${result?.modified ?? 0}\u0000${q}`;
-              putSnippet(
-                snippetCacheRef,
-                key,
-                typeof dto.snippet === "string" ? dto.snippet : null,
-              );
-              fetchedSnippetsRef.set(
-                dto.path,
-                typeof dto.snippet === "string" ? dto.snippet : null,
-              );
-              if (dto.snippet) patch.add(dto.path);
-            }
-          }
-          setResults((prev) => {
-            if (seq !== currentSeqRef.current || queryRef.current !== q) return prev;
-            let changed = false;
-            const next = prev.map((r) => {
-              if (r.snippet != null || !patch.has(r.path)) return r;
-              changed = true;
-              return { ...r, snippet: fetchedSnippetsRef.get(r.path) ?? null };
-            });
-            return changed ? next : prev;
-          });
-        })
-        .catch(() => {
-          /* snippets are optional decoration */
-        });
-    };
-
-    if (typeof IntersectionObserver === "undefined") {
-      const want: string[] = [];
-      for (const r of results) {
-        if (r.snippet != null) continue;
-        const key = `${r.path}\u0000${r.modified}\u0000${q}`;
-        if (snippetCacheRef.has(key)) continue;
-        want.push(r.path);
-        if (want.length >= 20) break;
-      }
-      if (want.length > 0) {
-        for (const path of want) pending.add(path);
-        flush();
-      }
-      return;
-    }
-
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    const schedule = () => {
-      if (timer) clearTimeout(timer);
-      timer = setTimeout(flush, 80);
-    };
-
-    const observer = new IntersectionObserver(
-      (entries) => {
-        for (const entry of entries) {
-          if (!entry.isIntersecting) continue;
-          const index = Number((entry.target as HTMLElement).getAttribute("data-index"));
-          const result = results[index];
-          if (!result || result.snippet != null) continue;
-          const key = `${result.path}\u0000${result.modified}\u0000${q}`;
-          if (snippetCacheRef.has(key)) continue;
-          if (pending.has(result.path)) continue;
-          pending.add(result.path);
-        }
-        if (pending.size > 0) schedule();
-      },
-      // Rows are virtualized: the grid only mounts the visible window, so a
-      // root of the outer wrapper never intersected anything and rows
-      // scrolled into view were never observed. The viewport is the honest
-      // root here, and a mutation observer picks up rows mounted later.
-      { root: null, threshold: 0.01 },
-    );
-
-    const observed = new WeakSet<Element>();
-    const observeRows = () => {
-      container.querySelectorAll("[data-index]").forEach((el) => {
-        if (observed.has(el)) return;
-        observed.add(el);
-        observer.observe(el);
-      });
-    };
-    observeRows();
-    const mutations = new MutationObserver(observeRows);
-    mutations.observe(container, { childList: true, subtree: true });
-
-    return () => {
-      mutations.disconnect();
-      observer.disconnect();
-      if (timer) clearTimeout(timer);
-    };
-  }, [results, query, isSetupComplete]);
-
   /* Infinite scroll guard. A page that adds nothing new marks this query as
      exhausted, so the grid stops asking. In-flight requests are ref-guarded,
      so repeated near-end signals can't stack up requests. */
@@ -534,15 +407,17 @@ function App() {
       // left, and pages requested before the current results arrived.
       if (res.cancelled || pageKeyRef.current !== requestKey) return;
       if (resultsQueryRef.current !== query.trim() || resultsLenRef.current !== offset) return;
-      let added = 0;
-      setResults((prev) => {
-        const seen = new Set(prev.map((r) => r.path));
-        const fresh = res.results.filter((r) => !seen.has(r.path));
-        added = fresh.length;
-        return fresh.length ? [...prev, ...fresh] : prev;
-      });
+      const seen = new Set(resultsRef.current.map((r) => r.path));
+      const fresh = res.results.filter((r) => !seen.has(r.path));
+      if (fresh.length > 0) {
+        setResults((prev) => {
+          const prevSeen = new Set(prev.map((r) => r.path));
+          const unique = res.results.filter((r) => !prevSeen.has(r.path));
+          return unique.length ? [...prev, ...unique] : prev;
+        });
+      }
       setTotal(res.total ?? 0);
-      if (added === 0 || res.results.length === 0) setExhaustedKey(requestKey);
+      if (fresh.length === 0 || res.results.length === 0) setExhaustedKey(requestKey);
     } catch (err) {
       console.error("Load more error:", err);
       setExhaustedKey(requestKey);
@@ -639,25 +514,31 @@ function App() {
       setFacetExclude(new Set());
       return;
     }
-    setFacetInclude((prev) => {
-      const next = new Set(prev);
-      if (alt) {
+    if (alt) {
+      setFacetInclude((prev) => {
+        if (!prev.has(id)) return prev;
+        const next = new Set(prev);
         next.delete(id);
-        setFacetExclude((ex) => {
-          const e = new Set(ex);
-          e.has(id) ? e.delete(id) : e.add(id);
-          return e;
-        });
-      } else {
+        return next;
+      });
+      setFacetExclude((ex) => {
+        const e = new Set(ex);
+        e.has(id) ? e.delete(id) : e.add(id);
+        return e;
+      });
+    } else {
+      setFacetInclude((prev) => {
+        const next = new Set(prev);
         next.has(id) ? next.delete(id) : next.add(id);
-        setFacetExclude((ex) => {
-          const e = new Set(ex);
-          e.delete(id);
-          return e;
-        });
-      }
-      return next;
-    });
+        return next;
+      });
+      setFacetExclude((ex) => {
+        if (!ex.has(id)) return ex;
+        const e = new Set(ex);
+        e.delete(id);
+        return e;
+      });
+    }
   }, []);
 
   const openSettings = useCallback((section?: string) => {
@@ -761,16 +642,22 @@ function App() {
      renders that return early below (first-launch setup screen): the setup
      render registers the handlers while never reaching the declaration, so a
      late `const navList` made every Space press throw a TDZ error. */
-  const displayResults = useMemo(
-    () =>
-      results.filter((r) => {
-        const cat = classify(r);
-        if (facetExclude.has(cat)) return false;
-        if (facetInclude.size > 0 && !facetInclude.has(cat)) return false;
-        return true;
-      }),
-    [results, facetInclude, facetExclude],
-  );
+  const displayResults = useMemo(() => {
+    const nowSec = Date.now() / 1000;
+    return results.filter((r) => {
+      for (const id of facetExclude) {
+        if (matchesCategory(r, id, nowSec)) return false;
+      }
+      if (facetInclude.size > 0) {
+        for (const id of facetInclude) {
+          if (matchesCategory(r, id, nowSec)) return true;
+        }
+        return false;
+      }
+      return true;
+    });
+  }, [results, facetInclude, facetExclude]);
+  displayResultsRef.current = displayResults;
   // The list keyboard navigation operates over: the search results, and
   // nothing while the field is empty.
   const hasQuery = query.trim() !== "";
@@ -787,6 +674,133 @@ function App() {
   useEffect(() => {
     setSelectedIndex(0);
   }, [hasQuery]);
+
+  useEffect(() => {
+    setSelectedIndex((i) =>
+      displayResults.length === 0 ? 0 : Math.min(i, displayResults.length - 1),
+    );
+  }, [displayResults.length]);
+
+  // Fetch snippets only for rows that are actually visible (or the first 20
+  // when IntersectionObserver is unavailable). Results are patched by path
+  // and stale responses for superseded queries are discarded.
+  useEffect(() => {
+    if (
+      !isSetupComplete ||
+      resultsRef.current.length === 0 ||
+      displayResultsRef.current.length === 0
+    ) {
+      return;
+    }
+    const container = resultsContainerRef.current;
+    if (!container) return;
+
+    const seq = currentSeqRef.current;
+    const q = query;
+    const pending = new Set<string>();
+
+    const flush = () => {
+      const paths = Array.from(pending).slice(0, 20);
+      pending.clear();
+      if (paths.length === 0) return;
+      invoke<SnippetDto[]>("get_snippets", { paths, query: q })
+        .then((dtos) => {
+          if (seq !== currentSeqRef.current || queryRef.current !== q) return;
+          if (!Array.isArray(dtos)) return;
+          const patch = new Set<string>();
+          for (const dto of dtos) {
+            if (dto && typeof dto.path === "string") {
+              const result = resultsRef.current.find((r) => r.path === dto.path);
+              const key = `${dto.path}\u0000${result?.modified ?? 0}\u0000${q}`;
+              putSnippet(
+                snippetCacheRef,
+                key,
+                typeof dto.snippet === "string" ? dto.snippet : null,
+              );
+              fetchedSnippetsRef.set(
+                dto.path,
+                typeof dto.snippet === "string" ? dto.snippet : null,
+              );
+              if (dto.snippet) patch.add(dto.path);
+            }
+          }
+          setResults((prev) => {
+            if (seq !== currentSeqRef.current || queryRef.current !== q) return prev;
+            let changed = false;
+            const next = prev.map((r) => {
+              if (r.snippet != null || !patch.has(r.path)) return r;
+              changed = true;
+              return { ...r, snippet: fetchedSnippetsRef.get(r.path) ?? null };
+            });
+            return changed ? next : prev;
+          });
+        })
+        .catch(() => {
+          /* snippets are optional decoration */
+        });
+    };
+
+    if (typeof IntersectionObserver === "undefined") {
+      const want: string[] = [];
+      for (const r of displayResultsRef.current) {
+        if (r.snippet != null) continue;
+        const key = `${r.path}\u0000${r.modified}\u0000${q}`;
+        if (snippetCacheRef.has(key)) continue;
+        want.push(r.path);
+        if (want.length >= 20) break;
+      }
+      if (want.length > 0) {
+        for (const path of want) pending.add(path);
+        flush();
+      }
+      return;
+    }
+
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const schedule = () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(flush, 80);
+    };
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          if (!entry.isIntersecting) continue;
+          const index = Number((entry.target as HTMLElement).getAttribute("data-index"));
+          const result = displayResultsRef.current[index];
+          if (!result || result.snippet != null) continue;
+          const key = `${result.path}\u0000${result.modified}\u0000${q}`;
+          if (snippetCacheRef.has(key)) continue;
+          if (pending.has(result.path)) continue;
+          pending.add(result.path);
+        }
+        if (pending.size > 0) schedule();
+      },
+      // Rows are virtualized: the grid only mounts the visible window, so a
+      // root of the outer wrapper never intersected anything and rows
+      // scrolled into view were never observed. The viewport is the honest
+      // root here, and a mutation observer picks up rows mounted later.
+      { root: null, threshold: 0.01 },
+    );
+
+    const observed = new WeakSet<Element>();
+    const observeRows = () => {
+      container.querySelectorAll("[data-index]").forEach((el) => {
+        if (observed.has(el)) return;
+        observed.add(el);
+        observer.observe(el);
+      });
+    };
+    observeRows();
+    const mutations = new MutationObserver(observeRows);
+    mutations.observe(container, { childList: true, subtree: true });
+
+    return () => {
+      mutations.disconnect();
+      observer.disconnect();
+      if (timer) clearTimeout(timer);
+    };
+  }, [query, sort, view, isSetupComplete, facetInclude, facetExclude, displayResults.length]);
 
   const handleKeyDown = useCallback(
     async (e: KeyboardEvent) => {
@@ -985,7 +999,7 @@ function App() {
         setDetails(navList[selectedIndex]);
       }
     },
-    [isSetupComplete, showSettings, showDuplicates, showHelp, details, menu, query, results, selectedIndex, commandOutput, handleRunCommand, handleOpenFile, handleOpenFolder, openSettings, view, setResultView, gridColumnCount, slashItems, slashIndex, scopePrefix, scopeItems, scopeIndex, applyScope, preview],
+    [isSetupComplete, showSettings, showDuplicates, showHelp, details, menu, query, navList, selectedIndex, commandOutput, handleRunCommand, handleOpenFile, handleOpenFolder, handleCopyPath, openSettings, view, setResultView, gridColumnCount, slashItems, slashIndex, scopePrefix, scopeItems, scopeIndex, applyScope, preview],
   );
 
   // Window-level, so shortcuts keep working after a dialog closes and focus

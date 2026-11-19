@@ -111,24 +111,7 @@ fn is_locked(error: &str) -> bool {
     lower.contains("locked") || lower.contains("busy")
 }
 
-/// Recursively sums regular files below `dir`. Symlinks are not followed.
-fn dir_size_bytes(dir: &Path) -> u64 {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return 0;
-    };
-    let mut total = 0u64;
-    for entry in entries.flatten() {
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if file_type.is_dir() {
-            total = total.saturating_add(dir_size_bytes(&entry.path()));
-        } else if file_type.is_file() {
-            total = total.saturating_add(entry.metadata().map(|m| m.len()).unwrap_or(0));
-        }
-    }
-    total
-}
+use crate::util::dir_size_bytes;
 
 fn dir_is_empty(dir: &Path) -> bool {
     match std::fs::read_dir(dir) {
@@ -621,6 +604,36 @@ fn check_watched_folders(state: &AppState) -> DoctorCheck {
 fn check_watcher(state: &AppState) -> DoctorCheck {
     const ID: &str = "watcher";
     const LABEL: &str = "File watcher";
+
+    if let Some(daemon) = state.daemon.as_ref() {
+        if let Ok(stats) = daemon.get_stats()
+            && stats
+                .get("runtime")
+                .and_then(|r| r.get("watcher_ok"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+        {
+            return ok(ID, LABEL, "Live filesystem watcher is running.".to_string());
+        }
+        if let Ok(st) = daemon.get_status()
+            && st.is_indexing
+        {
+            return ok(
+                ID,
+                LABEL,
+                "Starts when the current scan finishes.".to_string(),
+            );
+        }
+        return with_action(
+            warn(
+                ID,
+                LABEL,
+                "Watcher is not running and no scan is in progress.".to_string(),
+                None,
+            ),
+            DoctorAction::new("restart-watcher", "Restart indexing"),
+        );
+    }
 
     if state.indexer.watcher_ok() {
         return ok(ID, LABEL, "Live filesystem watcher is running.".to_string());

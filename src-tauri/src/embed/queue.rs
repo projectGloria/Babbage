@@ -67,7 +67,6 @@ impl EmbeddingQueue {
         let unit_store = Arc::clone(&self.unit_store);
         let status = self.status.clone();
         let app_handle = self.app_handle.clone();
-        let model = self.model.clone();
 
         let handle = thread::Builder::new()
             .name("babbage-embed-worker".to_string())
@@ -79,7 +78,7 @@ impl EmbeddingQueue {
                     .build()
                     .ok();
 
-                let mut hash_cache: HashMap<String, CachedChunks> = HashMap::new();
+                let mut hash_cache: HashMap<(u32, String), CachedChunks> = HashMap::new();
                 let mut was_embedding = false;
                 let mut idle_polls: u32 = 0;
 
@@ -89,6 +88,9 @@ impl EmbeddingQueue {
                         thread::sleep(Duration::from_millis(50));
                         continue;
                     }
+
+                    // Always observe the latest reloaded model on every batch.
+                    let model = ModelRegistry::global();
 
                     // TODO: Check battery state (e.g. AC power) and skip if on battery power
 
@@ -147,9 +149,9 @@ impl EmbeddingQueue {
                     }
 
                     // Collect all units across the batch first (read + embed in parallel),
-                    // then do a single DB transaction + single UnitStore write.
-                    let mut batch_units: Vec<(u64, Unit, Vec<i8>, String)> = Vec::new();
-                    let mut batch_node_ids: Vec<u64> = Vec::new();
+                    // then commit one SQLite transaction before acquiring UnitStore write lock.
+                    let mut batch_units: Vec<(u64, usize, usize, u32, Vec<i8>)> = Vec::new();
+                    let mut batch_nodes: Vec<(u64, String)> = Vec::new();
 
                     for (node_id, path, size, _modified, _existing_hash) in pending_nodes {
                         if !is_running.load(Ordering::SeqCst) {
@@ -189,9 +191,10 @@ impl EmbeddingQueue {
                         };
 
                         let content_hash = format!("{:x}", fnv_hash(&content));
+                        let cache_key = (model.model_id, content_hash.clone());
 
                         let chunks_with_vectors =
-                            if let Some(cached) = hash_cache.get(&content_hash) {
+                            if let Some(cached) = hash_cache.get(&cache_key) {
                                 Arc::clone(cached)
                             } else {
                                 let chunks = chunk_text(&content, size as usize);
@@ -219,53 +222,51 @@ impl EmbeddingQueue {
 
                                 let computed = Arc::new(computed);
                                 if hash_cache.len() < 512 {
-                                    hash_cache.insert(content_hash.clone(), Arc::clone(&computed));
+                                    hash_cache.insert(cache_key, Arc::clone(&computed));
                                 }
                                 computed
                             };
 
-                        batch_node_ids.push(node_id);
+                        batch_nodes.push((node_id, content_hash));
                         for (start, end, vec) in chunks_with_vectors.iter() {
-                            batch_units.push((
-                                node_id,
-                                Unit {
-                                    id: 0,
-                                    node_id,
-                                    byte_start: *start,
-                                    byte_end: *end,
-                                    model_id: model.model_id,
-                                },
-                                vec.clone(),
-                                content_hash.clone(),
-                            ));
-                        }
-
-                        // Mark node as processed (hash stored for dedup)
-                        let _ = db.update_node_indexed_gen(node_id, 1, Some(&content_hash));
-                    }
-
-                    // Batch delete + insert: one statement/pass for all nodes
-                    let _ = db.delete_units_for_nodes(&batch_node_ids);
-
-                    // Batch insert all units
-                    let mut unit_store_write = unit_store.write();
-                    let replaced: std::collections::HashSet<u64> =
-                        batch_node_ids.iter().copied().collect();
-                    unit_store_write.remove_units_for_nodes(&replaced);
-
-                    for (node_id, mut unit, vec, _hash) in batch_units {
-                        if let Ok(inserted_id) = db.insert_unit(
-                            node_id,
-                            unit.byte_start,
-                            unit.byte_end,
-                            model.model_id,
-                            &vec,
-                        ) {
-                            unit.id = inserted_id;
-                            unit_store_write.add_unit(unit, &vec);
+                            batch_units.push((node_id, *start, *end, model.model_id, vec.clone()));
                         }
                     }
-                    drop(unit_store_write);
+
+                    if !batch_nodes.is_empty() {
+                        match db.write_embedding_batch(&batch_nodes, &batch_units) {
+                            Ok(inserted_ids) => {
+                                let replaced: std::collections::HashSet<u64> =
+                                    batch_nodes.iter().map(|(id, _)| *id).collect();
+                                let mut unit_store_write = unit_store.write();
+                                if unit_store_write.dim != model.dim {
+                                    unit_store_write.retain_model(model.model_id);
+                                    unit_store_write.dim = model.dim;
+                                }
+                                unit_store_write.remove_units_for_nodes(&replaced);
+                                for (inserted_id, (node_id, byte_start, byte_end, model_id, vec)) in
+                                    inserted_ids.into_iter().zip(batch_units)
+                                {
+                                    unit_store_write.add_unit(
+                                        Unit {
+                                            id: inserted_id,
+                                            node_id,
+                                            byte_start,
+                                            byte_end,
+                                            model_id,
+                                        },
+                                        &vec,
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "[Babbage Embedder] Failed to commit embedding batch: {}",
+                                    e
+                                );
+                            }
+                        }
+                    }
 
                     // Update indexing status progress
                     if let Some(st_arc) = &status {

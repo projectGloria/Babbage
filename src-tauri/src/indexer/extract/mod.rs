@@ -120,41 +120,53 @@ pub enum DocumentFormat {
     Delimited,
     PlainText,
     Image,
+    Excluded,
     Unknown,
 }
 
 /// Sniffs the format using magic bytes first, falling back to file extension.
 pub fn sniff_format(path: &Path) -> DocumentFormat {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    if matches!(
+        ext.as_str(),
+        "pem" | "key" | "pfx" | "p12" | "kdbx" | "keystore" | "jks" | "asc" | "ovpn"
+    ) {
+        return DocumentFormat::Excluded;
+    }
+
     let mut header = [0u8; 16];
     if let Ok(mut f) = File::open(path)
         && let Ok(n) = f.read(&mut header)
         && n >= 4
     {
         // PDF magic: %PDF-
-        if header.starts_with(b"%PDF-") {
+        if n >= 5 && header.starts_with(b"%PDF-") {
             return DocumentFormat::Pdf;
         }
         // RTF magic: {\rtf
-        if header.starts_with(b"{\\rtf") {
+        if n >= 5 && header.starts_with(b"{\\rtf") {
             return DocumentFormat::Rtf;
         }
-        // Image magic bytes
-        if header.starts_with(b"\x89PNG")
-            || header.starts_with(b"\xff\xd8\xff")
-            || header.starts_with(b"GIF8")
-            || header.starts_with(b"RIFF")
-            || header.starts_with(b"BM")
-        {
+        // Image magic bytes (strict header validation avoids misclassifying
+        // text starting with "BM" or RIFF audio/video as images).
+        let is_png = n >= 8 && header.starts_with(b"\x89PNG\r\n\x1a\n");
+        let is_jpeg = header.starts_with(b"\xff\xd8\xff");
+        let is_gif = n >= 6 && (header.starts_with(b"GIF87a") || header.starts_with(b"GIF89a"));
+        let is_webp = n >= 12 && header.starts_with(b"RIFF") && &header[8..12] == b"WEBP";
+        let is_bmp = n >= 14
+            && header.starts_with(b"BM")
+            && header[6..10] == [0, 0, 0, 0]
+            && (ext == "bmp" || ext.is_empty());
+        if is_png || is_jpeg || is_gif || is_webp || is_bmp {
             return DocumentFormat::Image;
         }
         // ZIP magic: PK\x03\x04
         if header.starts_with(b"PK\x03\x04") {
-            // Differentiate by extension
-            let ext = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("")
-                .to_lowercase();
             return match ext.as_str() {
                 "docx" => DocumentFormat::Docx,
                 "pptx" => DocumentFormat::Pptx,
@@ -169,12 +181,6 @@ pub fn sniff_format(path: &Path) -> DocumentFormat {
     }
 
     // Fallback to extension
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase();
-
     match ext.as_str() {
         "pdf" => DocumentFormat::Pdf,
         "docx" => DocumentFormat::Docx,
@@ -185,9 +191,8 @@ pub fn sniff_format(path: &Path) -> DocumentFormat {
         "ods" => DocumentFormat::Ods,
         "odp" => DocumentFormat::Odp,
         "rtf" => DocumentFormat::Rtf,
-        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "tiff" | "tif" | "heic" | "heif" => {
-            DocumentFormat::Image
-        }
+        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "tiff" | "tif" | "ico" | "heic"
+        | "heif" => DocumentFormat::Image,
         "csv" | "tsv" => DocumentFormat::Delimited,
         "txt" | "md" | "markdown" | "rs" | "ts" | "tsx" | "js" | "jsx" | "py" | "go" | "json"
         | "toml" | "yaml" | "yml" | "xml" | "html" | "htm" | "css" | "c" | "cpp" | "h" | "java"
@@ -665,6 +670,7 @@ fn extract_document_inner(
     }
 
     match format {
+        DocumentFormat::Excluded => None,
         DocumentFormat::Pdf => {
             let res = pdf::extract_pdf(path, capped_bytes)?;
             if res.ocr_unavailable {

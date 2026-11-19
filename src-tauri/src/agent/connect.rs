@@ -106,30 +106,32 @@ pub fn server_entry() -> Value {
 
 /// Best-effort absolute path to the CLI binary shipped next to this process.
 pub fn cli_command() -> String {
+    const CLI_BIN: &str = if cfg!(windows) {
+        "babbage-cli.exe"
+    } else {
+        "babbage-cli"
+    };
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
     {
-        candidates.push(dir.join("babbage-cli"));
-        candidates.push(dir.join("babbage-cli"));
+        candidates.push(dir.join(CLI_BIN));
     }
     if let Some(home) = dirs::home_dir() {
-        candidates.push(home.join(".cargo/bin/babbage-cli"));
-        candidates.push(home.join(".local/bin/babbage-cli"));
-        candidates.push(home.join(".cargo/bin/babbage-cli"));
+        candidates.push(home.join(".cargo/bin").join(CLI_BIN));
+        candidates.push(home.join(".local/bin").join(CLI_BIN));
     }
     if let Some(path) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path) {
-            candidates.push(dir.join("babbage-cli"));
-            candidates.push(dir.join("babbage-cli"));
+            candidates.push(dir.join(CLI_BIN));
         }
     }
-    candidates.push(PathBuf::from("babbage-cli"));
+    candidates.push(PathBuf::from(CLI_BIN));
     candidates
         .into_iter()
         .find(|path| path.is_file())
         .map(|path| path.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "babbage-cli".to_string())
+        .unwrap_or_else(|| CLI_BIN.to_string())
 }
 
 /// Status for every supported client (locatable config path, installed,
@@ -179,7 +181,7 @@ fn is_configured(raw: &str) -> bool {
 fn has_babbage(servers: Option<&Value>) -> bool {
     servers
         .and_then(Value::as_object)
-        .and_then(|servers| servers.get("babbage").or_else(|| servers.get("babbage")))
+        .and_then(|servers| servers.get("babbage").or_else(|| servers.get("Babbage")))
         .map(|entry| entry.get("command").is_some())
         .unwrap_or(false)
 }

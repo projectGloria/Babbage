@@ -40,9 +40,13 @@ pub fn query_pool() -> &'static rayon::ThreadPool {
 pub fn crawl_pool() -> &'static rayon::ThreadPool {
     static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
     POOL.get_or_init(|| {
+        let mode = crate::config::BabbageConfig::load().crawl_mode;
         rayon::ThreadPoolBuilder::new()
             .num_threads(cores().saturating_sub(1).max(2))
             .thread_name(|i| format!("babbage-crawl-{i}"))
+            .start_handler(move |_| {
+                crate::util::priority::apply(mode);
+            })
             .build()
             .expect("crawl thread pool")
     })

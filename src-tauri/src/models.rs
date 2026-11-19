@@ -360,8 +360,12 @@ fn download_running() -> bool {
     with_state(|state| state.running.is_some())
 }
 
+fn user_models_dir() -> PathBuf {
+    BabbageConfig::config_dir().join("models")
+}
+
 pub fn models_dir() -> PathBuf {
-    let user_dir = BabbageConfig::config_dir().join("models");
+    let user_dir = user_models_dir();
     if user_dir.join("model.safetensors").is_file() {
         return user_dir;
     }
@@ -446,7 +450,15 @@ pub fn indra_status() -> ModelsStatus {
 }
 
 pub fn smart_dir() -> PathBuf {
-    models_dir().join("smart")
+    let user_dir = user_models_dir().join("smart");
+    if user_dir.join("model.onnx").is_file() {
+        return user_dir;
+    }
+    let bundled = models_dir().join("smart");
+    if bundled.join("model.onnx").is_file() {
+        return bundled;
+    }
+    user_dir
 }
 
 pub fn smart_pack_present() -> bool {
@@ -460,7 +472,15 @@ pub fn smart_status() -> ModelsStatus {
 }
 
 pub fn visual_dir() -> PathBuf {
-    models_dir().join("visual")
+    let user_dir = user_models_dir().join("visual");
+    if user_dir.join("vision_model.onnx").is_file() {
+        return user_dir;
+    }
+    let bundled = models_dir().join("visual");
+    if bundled.join("vision_model.onnx").is_file() {
+        return bundled;
+    }
+    user_dir
 }
 
 pub fn visual_pack_present() -> bool {
@@ -523,7 +543,12 @@ fn status_for(dir: &Path, artifacts_list: &[Artifact]) -> ModelsStatus {
 /// Returns immediately. Returns [`BUSY_DOWNLOAD`] if another pack is already
 /// downloading, so callers can tell the user instead of failing silently.
 pub fn download_all() -> Result<(), String> {
-    start_download(models_dir(), &ARTIFACTS, "babbage-model-download", "model")
+    start_download(
+        user_models_dir(),
+        &ARTIFACTS,
+        "babbage-model-download",
+        "model",
+    )
 }
 
 /// Called once an OCR pack (PP-OCR or Indra) has finished downloading and
@@ -569,7 +594,7 @@ pub fn download_indra_pack() -> Result<(), String> {
 /// Starts a background download of the optional ONNX smart embedding pack.
 pub fn download_smart_pack() -> Result<(), String> {
     start_download(
-        smart_dir(),
+        user_models_dir().join("smart"),
         &SMART_ARTIFACTS,
         "babbage-smart-download",
         "smart embedding pack",
@@ -579,7 +604,7 @@ pub fn download_smart_pack() -> Result<(), String> {
 /// Starts a background download of the optional ONNX visual embedding pack.
 pub fn download_visual_pack() -> Result<(), String> {
     start_download(
-        visual_dir(),
+        user_models_dir().join("visual"),
         &VISUAL_ARTIFACTS,
         "babbage-visual-download",
         "visual embedding pack",
@@ -643,7 +668,7 @@ fn run_download(dir: PathBuf, artifacts: &'static [Artifact], pack: Pack, label:
                 set_running(None);
                 callback();
             }
-            if pack == Pack::Models {
+            if matches!(pack, Pack::Models | Pack::Smart) {
                 // Without this the files sat on disk while search kept ranking
                 // on the hashing fallback, because the registry was built once
                 // at startup and never rebuilt.
@@ -938,12 +963,14 @@ pub fn delete_all() -> Result<(), String> {
         return Err("A model download is in progress. Try again once it finishes.".to_string());
     }
 
-    let dir = models_dir();
+    let dir = user_models_dir();
     if dir.exists() {
         std::fs::remove_dir_all(&dir)
             .map_err(|e| format!("Failed to delete {}: {}", dir.display(), e))?;
     }
     ensure_dir(&dir)?;
+
+    let _ = crate::embed::ModelRegistry::reload();
 
     with_state(|state| {
         state.progress = None;

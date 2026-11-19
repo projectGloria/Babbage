@@ -878,17 +878,10 @@ impl SearchDispatcher {
             .map(|d| d.as_secs())
             .unwrap_or(0);
 
-        let trie = metadata.get_directory_trie();
-        // Materializing a FileEntry reconstructs the path from the node arena,
-        // joins a PathBuf and copies the name: several allocations per file,
-        // for every query. On a 25k-file corpus that is ~100k allocations per
-        // keystroke, which is the arena's whole purpose undone by the query
-        // path. The store bumps `generation` on every mutation that can change
-        // this list, so caching against it is a single comparison.
-        // Cached inside the store, per generation: see `entries_snapshot`.
         let generation = metadata.generation();
         let entries = metadata.entries_snapshot();
         let needs_trie = query_needs_trie(effective_query);
+        let mut trie_opt = needs_trie.then(|| metadata.get_directory_trie());
         let path_index: HashMap<PathBuf, usize> = if needs_trie {
             entries
                 .iter()
@@ -929,20 +922,27 @@ impl SearchDispatcher {
             effective_query,
             &entries,
             &path_index,
-            needs_trie.then_some(&trie),
+            trie_opt.as_deref(),
             generation,
         );
         let route = crate::query::router::route_query(&parsed);
 
-        // Pre-compile filters once per query (lowercase strings, intern extensions)
-        let compiled_filters: Vec<CompiledFilter> =
+        // Pre-compile filters once per query (lowercase strings, intern extensions),
+        // including positive `path:` terms so basename `char_bloom` never drops them.
+        let mut compiled_filters: Vec<CompiledFilter> =
             parsed.filters.iter().map(CompiledFilter::from).collect();
+        for t in &parsed.terms {
+            if !t.is_regex && t.field == TermField::Path {
+                compiled_filters.push(CompiledFilter::Path(t.text.to_lowercase()));
+            }
+        }
         // Positive ext/size clauses can safely narrow the Tantivy query; the
         // normal metadata filter still runs afterwards.
         let pushdown_filters = content_pushdown(&parsed.filters);
 
         // 2. Resolve scopes and filter candidates
         let candidate_indices: Vec<usize> = if !parsed.scopes.is_empty() {
+            let trie = trie_opt.get_or_insert_with(|| metadata.get_directory_trie());
             let mut included = HashSet::new();
             let mut has_include_scope = false;
 
@@ -986,7 +986,7 @@ impl SearchDispatcher {
                     }
                 })
                 .collect()
-        } else if !parsed.filters.is_empty() {
+        } else if !compiled_filters.is_empty() {
             (0..entries.len())
                 .filter(|&idx| matches_all_compiled_filters(&compiled_filters, &entries[idx]))
                 .collect()
@@ -997,8 +997,8 @@ impl SearchDispatcher {
         // Extract positive terms text, split by field scoping (name:/content:/path:)
         // so that field-scoped terms only search their target field. Regex terms
         // (`re:`) never enter the fuzzy/BM25 text tiers.
-        let mut fuzzy_terms: Vec<&str> = Vec::new(); // Any, Name, Path → fuzzy (filename + path)
-        let mut bm25_groups: Vec<(FieldKind, &str)> = Vec::new();
+        let mut fuzzy_terms: Vec<&str> = Vec::new(); // Any, Name → fuzzy
+        let mut bm25_owned: Vec<(FieldKind, String)> = Vec::new();
         let mut regex_patterns: Vec<&str> = Vec::new();
         let has_near = !parsed.proximity.is_empty();
 
@@ -1008,7 +1008,19 @@ impl SearchDispatcher {
             }
         }
 
-        let mut proximity_phrase_strings: Vec<String> = Vec::new();
+        let format_bm25 = |t: &crate::query::ast::Term| -> String {
+            if t.phrase {
+                let clean = crate::indexer::content::sanitize_query_text(&t.text);
+                let trimmed = clean.trim();
+                if trimmed.is_empty() {
+                    String::new()
+                } else {
+                    format!("\"{}\"", trimmed)
+                }
+            } else {
+                t.text.clone()
+            }
+        };
 
         if has_near {
             let mut involved: HashSet<usize> = HashSet::new();
@@ -1024,10 +1036,7 @@ impl SearchDispatcher {
                     "{} near[{}] {}",
                     parsed.terms[*i].text, distance, parsed.terms[*j].text
                 );
-                proximity_phrase_strings.push(expr);
-            }
-            for expr in &proximity_phrase_strings {
-                bm25_groups.push((FieldKind::Any, expr.as_str()));
+                bm25_owned.push((FieldKind::Any, expr));
             }
             for (idx, t) in parsed.terms.iter().enumerate() {
                 if t.is_regex || involved.contains(&idx) {
@@ -1035,13 +1044,13 @@ impl SearchDispatcher {
                 }
                 match t.field {
                     TermField::Any => {
-                        bm25_groups.push((FieldKind::Any, &t.text));
+                        bm25_owned.push((FieldKind::Any, format_bm25(t)));
                     }
                     TermField::Name => {
-                        bm25_groups.push((FieldKind::Name, &t.text));
+                        bm25_owned.push((FieldKind::Name, format_bm25(t)));
                     }
                     TermField::Content => {
-                        bm25_groups.push((FieldKind::Content, &t.text));
+                        bm25_owned.push((FieldKind::Content, format_bm25(t)));
                     }
                     TermField::Path => {}
                 }
@@ -1054,25 +1063,29 @@ impl SearchDispatcher {
                 match t.field {
                     TermField::Any => {
                         fuzzy_terms.push(&t.text);
-                        bm25_groups.push((FieldKind::Any, &t.text));
+                        bm25_owned.push((FieldKind::Any, format_bm25(t)));
                     }
                     TermField::Name => {
                         fuzzy_terms.push(&t.text);
-                        bm25_groups.push((FieldKind::Name, &t.text));
+                        bm25_owned.push((FieldKind::Name, format_bm25(t)));
                     }
                     TermField::Content => {
-                        bm25_groups.push((FieldKind::Content, &t.text));
+                        bm25_owned.push((FieldKind::Content, format_bm25(t)));
                     }
-                    TermField::Path => {
-                        fuzzy_terms.push(&t.text);
-                    }
+                    TermField::Path => {}
                 }
             }
         }
-        let fuzzy_text = fuzzy_terms.join(" ");
-        let bm25_text: String = bm25_groups
+        let bm25_groups: Vec<(FieldKind, &str)> = bm25_owned
             .iter()
-            .map(|(_, text)| *text)
+            .map(|(k, s)| (*k, s.as_str()))
+            .collect();
+        let fuzzy_text = fuzzy_terms.join(" ");
+        let bm25_text: String = parsed
+            .terms
+            .iter()
+            .filter(|t| !t.is_regex && t.field != TermField::Path)
+            .map(|t| t.text.as_str())
             .collect::<Vec<_>>()
             .join(" ");
         let search_text = if fuzzy_text.is_empty() {
@@ -1678,15 +1691,15 @@ fn finalize_score(
     };
     let mut score = base;
 
-    // Exact substring in name: +0.20
-    let name_lower = entry.name.to_lowercase();
-    if !search_text_lower.is_empty() && name_lower.contains(search_text_lower) {
-        score += 0.20;
-    }
-
-    // Prefix in name: +0.15
-    if !search_text_lower.is_empty() && name_lower.starts_with(search_text_lower) {
-        score += 0.15;
+    // Exact substring and prefix in name: +0.20 / +0.15
+    if !search_text_lower.is_empty() {
+        let name_lower = entry.name.to_lowercase();
+        if name_lower.contains(search_text_lower) {
+            score += 0.20;
+        }
+        if name_lower.starts_with(search_text_lower) {
+            score += 0.15;
+        }
     }
 
     // Smooth recency decay: +0.10 * exp(-age_days / 7)
@@ -1916,7 +1929,11 @@ impl CompiledFilter {
             // run once per file in the corpus, so match without allocating.
             CompiledFilter::Name(name) => contains_ignore_case(&entry.name, name),
             CompiledFilter::Path(path_substr) => {
-                contains_ignore_case(&entry.path.to_string_lossy(), path_substr)
+                if cfg!(windows) && path_substr.contains('/') {
+                    contains_ignore_case(&entry.path.to_string_lossy().replace('\\', "/"), path_substr)
+                } else {
+                    contains_ignore_case(&entry.path.to_string_lossy(), path_substr)
+                }
             }
             CompiledFilter::Not(inner) => !inner.matches(entry),
         }
@@ -1998,10 +2015,19 @@ fn matches_type_category(typ: &str, ext_opt: Option<&str>, is_dir: bool) -> bool
         );
     }
     if ext_is(typ, &["video"]) {
-        return ext_is(ext, &["mp4", "mkv", "mov", "avi", "webm", "flv"]);
+        return ext_is(ext, &["mp4", "mkv", "mov", "avi", "webm", "flv", "wmv", "m4v"]);
     }
     if ext_is(typ, &["audio"]) {
-        return ext_is(ext, &["mp3", "wav", "flac", "aac", "ogg", "m4a"]);
+        return ext_is(ext, &["mp3", "wav", "flac", "aac", "ogg", "m4a", "wma", "opus"]);
+    }
+    if ext_is(typ, &["media"]) {
+        return ext_is(
+            ext,
+            &[
+                "mp4", "mkv", "mov", "avi", "webm", "flv", "wmv", "m4v", "mp3", "wav", "flac",
+                "aac", "ogg", "m4a", "wma", "opus",
+            ],
+        );
     }
     if ext_is(typ, &["archive"]) {
         return ext_is(ext, &["zip", "tar", "gz", "bz2", "7z", "rar", "xz"]);

@@ -67,7 +67,7 @@ export const KeyHintStrip: React.FC<{
             type="button"
             onClick={onDoctor}
             title={issues ? t("health.issue", { count: issues }) : t("health.ok")}
-            className={`flex items-center gap-1 rounded-full px-1.5 py-0.5 transition-colors hover:bg-surface-2 ${issues ? "text-warning" : "text-subtle"}`}
+            className={`flex items-center gap-1 rounded-full px-1.5 py-0.5 transition-colors hover:bg-accent-soft ${issues ? "text-warning" : "text-subtle"}`}
           >
             <Stethoscope className="h-3.5 w-3.5" />
             {issues > 0 && <span className="t-meta">{t("health.issuesShort", { count: issues })}</span>}
@@ -78,7 +78,7 @@ export const KeyHintStrip: React.FC<{
             type="button"
             onClick={onUpdate}
             title={t("update.available", { version: updateAvailable })}
-            className="flex items-center gap-1 rounded-full px-1.5 py-0.5 text-accent transition-colors hover:bg-surface-2"
+            className="flex items-center gap-1 rounded-full px-1.5 py-0.5 text-accent transition-colors hover:bg-accent-soft"
           >
             <ArrowUpCircle className="h-3.5 w-3.5" />
             <span className="t-meta">{t("update.label")}</span>

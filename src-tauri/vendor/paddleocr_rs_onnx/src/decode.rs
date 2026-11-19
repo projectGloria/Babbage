@@ -66,7 +66,7 @@ pub fn ctc_decode(probs: &[Vec<f32>], keys: &[String]) -> DecodedText {
             .iter()
             .copied()
             .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+            .max_by(|a, b| a.1.total_cmp(&b.1))
             .unwrap_or((blank_idx, 0.0));
 
         if max_idx != blank_idx && max_idx != prev_char_idx {
@@ -88,7 +88,7 @@ pub fn ctc_decode(probs: &[Vec<f32>], keys: &[String]) -> DecodedText {
             keys.len(),
             probs.iter()
                 .flat_map(|t| t.iter().enumerate())
-                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+                .max_by(|a, b| a.1.total_cmp(b.1))
                 .map(|(idx, _)| idx)
                 .unwrap_or(0),
         );

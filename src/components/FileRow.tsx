@@ -2,7 +2,7 @@ import React from "react";
 import { useTranslation } from "react-i18next";
 import { HighlightedName } from "./EmptyState";
 import { isThumbImage, useThumbnail } from "../lib/thumbnails";
-import { displayParent, formatBytes, formatRelativeTime } from "../lib/format";
+import { displayParent, fileUri, formatBytes, formatRelativeTime } from "../lib/format";
 import { extOf } from "./TypeTile";
 
 /* One file per row, fixed height. Used for list results and recents so the
@@ -43,7 +43,7 @@ export const FileRow = React.memo(function FileRow({
 
   return (
     <div
-      role="row"
+      role="option"
       aria-selected={selected}
       title={item.path}
       onClick={onSelect}
@@ -63,7 +63,7 @@ export const FileRow = React.memo(function FileRow({
       onDragStart={(e) => {
         e.dataTransfer.effectAllowed = "copy";
         e.dataTransfer.setData("text/plain", item.path);
-        e.dataTransfer.setData("text/uri-list", `file://${item.path}`);
+        e.dataTransfer.setData("text/uri-list", fileUri(item.path));
       }}
       style={{ height: FILE_ROW_HEIGHT }}
       className={`group relative flex w-full cursor-default items-center gap-2.5 rounded-control px-2.5 transition-colors duration-150 ${
@@ -90,4 +90,13 @@ export const FileRow = React.memo(function FileRow({
       <span className="t-meta w-16 shrink-0 text-right text-subtle">{formatRelativeTime(item.modified, t)}</span>
     </div>
   );
-});
+},
+(prev, next) =>
+  prev.item.path === next.item.path &&
+  prev.item.filename === next.item.filename &&
+  prev.item.file_size === next.item.file_size &&
+  prev.item.modified === next.item.modified &&
+  prev.item.is_dir === next.item.is_dir &&
+  prev.query === next.query &&
+  prev.selected === next.selected &&
+  prev.showThumbs === next.showThumbs);

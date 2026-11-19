@@ -49,11 +49,7 @@ openvino = ["ort/openvino"]
 
 [lib]
 name = "paddleocr_rs_onnx"
-crate-type = [
-    "lib",
-    "cdylib",
-    "staticlib",
-]
+crate-type = ["rlib"]
 path = "src/lib.rs"
 
 [dependencies.geo]
@@ -61,6 +57,8 @@ version = "0.33"
 
 [dependencies.image]
 version = "0.25"
+default-features = false
+features = ["png", "jpeg", "gif", "webp", "bmp", "tiff", "ico"]
 
 [dependencies.imageproc]
 version = "0.27"

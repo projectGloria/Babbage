@@ -4,7 +4,6 @@ import LanguageDetector from "i18next-browser-languagedetector";
 
 import enCommon from "../locales/en/common.json";
 import enSearch from "../locales/en/search.json";
-import enHome from "../locales/en/home.json";
 import enResults from "../locales/en/results.json";
 import enDetails from "../locales/en/details.json";
 import enHelp from "../locales/en/help.json";
@@ -14,7 +13,6 @@ import enErrors from "../locales/en/errors.json";
 
 import zhCommon from "../locales/zh/common.json";
 import zhSearch from "../locales/zh/search.json";
-import zhHome from "../locales/zh/home.json";
 import zhResults from "../locales/zh/results.json";
 import zhDetails from "../locales/zh/details.json";
 import zhHelp from "../locales/zh/help.json";
@@ -24,7 +22,6 @@ import zhErrors from "../locales/zh/errors.json";
 
 import ruCommon from "../locales/ru/common.json";
 import ruSearch from "../locales/ru/search.json";
-import ruHome from "../locales/ru/home.json";
 import ruResults from "../locales/ru/results.json";
 import ruDetails from "../locales/ru/details.json";
 import ruHelp from "../locales/ru/help.json";
@@ -44,7 +41,6 @@ const resources = {
   en: {
     common: enCommon,
     search: enSearch,
-    home: enHome,
     results: enResults,
     details: enDetails,
     help: enHelp,
@@ -55,7 +51,6 @@ const resources = {
   zh: {
     common: zhCommon,
     search: zhSearch,
-    home: zhHome,
     results: zhResults,
     details: zhDetails,
     help: zhHelp,
@@ -66,7 +61,6 @@ const resources = {
   ru: {
     common: ruCommon,
     search: ruSearch,
-    home: ruHome,
     results: ruResults,
     details: ruDetails,
     help: ruHelp,
@@ -89,7 +83,6 @@ i18n
     ns: [
       "common",
       "search",
-      "home",
       "results",
       "details",
       "help",

@@ -87,6 +87,8 @@ export function ResultControls({
   const [savedOpen, setSavedOpen] = useState(false);
   const [saved, setSaved] = useState<SavedSearch[]>([]);
   const savedWrapRef = useRef<HTMLDivElement>(null);
+  const savedBtnRef = useRef<HTMLButtonElement>(null);
+  const savedMenuRef = useRef<HTMLDivElement>(null);
 
   const toggleSaved = async () => {
     if (savedOpen) {
@@ -122,6 +124,18 @@ export function ResultControls({
     };
     document.addEventListener("mousedown", onDown);
     return () => document.removeEventListener("mousedown", onDown);
+  }, [savedOpen]);
+
+  const wasSavedOpen = useRef(false);
+  useEffect(() => {
+    const justClosed = wasSavedOpen.current && !savedOpen;
+    wasSavedOpen.current = savedOpen;
+    if (savedOpen) {
+      const first = savedMenuRef.current?.querySelector<HTMLButtonElement>('[role="menuitem"]');
+      (first ?? savedMenuRef.current)?.focus({ preventScroll: true });
+    } else if (justClosed) {
+      savedBtnRef.current?.focus({ preventScroll: true });
+    }
   }, [savedOpen]);
 
   const choose = (value: string) => {
@@ -244,6 +258,7 @@ export function ResultControls({
             </button>
           )}
           <button
+            ref={savedBtnRef}
             type="button"
             aria-haspopup="menu"
             aria-expanded={savedOpen}
@@ -258,13 +273,35 @@ export function ResultControls({
 
         {savedOpen && (
           <div
+            ref={savedMenuRef}
             role="menu"
+            tabIndex={-1}
             aria-label={t("savedSearches")}
             onKeyDown={(e) => {
-              if (e.key !== "Escape") return;
-              e.preventDefault();
-              e.stopPropagation();
-              setSavedOpen(false);
+              if (e.key === "Escape") {
+                e.preventDefault();
+                e.stopPropagation();
+                setSavedOpen(false);
+                return;
+              }
+              const items = Array.from(
+                e.currentTarget.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'),
+              );
+              if (items.length === 0) return;
+              const idx = items.indexOf(document.activeElement as HTMLButtonElement);
+              if (e.key === "ArrowDown") {
+                e.preventDefault();
+                items[(idx + 1) % items.length].focus();
+              } else if (e.key === "ArrowUp") {
+                e.preventDefault();
+                items[(idx - 1 + items.length) % items.length].focus();
+              } else if (e.key === "Home") {
+                e.preventDefault();
+                items[0].focus();
+              } else if (e.key === "End") {
+                e.preventDefault();
+                items[items.length - 1].focus();
+              }
             }}
             className="menu-pop elevated absolute right-0 z-[70] mt-1.5 max-h-[280px] w-[240px] overflow-y-auto p-1"
           >

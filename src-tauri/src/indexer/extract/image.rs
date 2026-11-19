@@ -38,8 +38,27 @@ pub const THUMB_SIZE: u32 = 240;
 pub fn is_supported_image_extension(ext: &str) -> bool {
     matches!(
         ext.to_ascii_lowercase().as_str(),
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tiff" | "tif"
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tiff" | "tif" | "ico"
     )
+}
+
+/// Converts a `DynamicImage` to `RgbImage`, alpha-compositing transparent
+/// images over `bg` instead of dropping the alpha channel to black.
+pub fn to_rgb8_composited(img: &DynamicImage, bg: [u8; 3]) -> image::RgbImage {
+    if !img.color().has_alpha() {
+        return img.to_rgb8();
+    }
+    let rgba = img.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    let mut out = image::RgbImage::new(w, h);
+    for (src, dst) in rgba.pixels().zip(out.pixels_mut()) {
+        let a = u32::from(src[3]);
+        let inv = 255 - a;
+        dst[0] = ((u32::from(src[0]) * a + u32::from(bg[0]) * inv + 127) / 255) as u8;
+        dst[1] = ((u32::from(src[1]) * a + u32::from(bg[1]) * inv + 127) / 255) as u8;
+        dst[2] = ((u32::from(src[2]) * a + u32::from(bg[2]) * inv + 127) / 255) as u8;
+    }
+    out
 }
 
 /// Snapshot of the local OCR engine and its language data.
@@ -359,9 +378,9 @@ pub fn ocr_status() -> OcrStatus {
     let mut list = tesseract_command();
     list.arg("--list-langs");
     // The configured (private) tessdata directory takes precedence when it
-    // exists, mirroring what `extract_image_ocr` does at runtime.
-    if dir.is_dir() {
-        list.env("TESSDATA_PREFIX", &dir);
+    // contains language data, mirroring what `extract_image_ocr` does at runtime.
+    if let Some(dir) = private_tessdata(&dir) {
+        list.env("TESSDATA_PREFIX", dir);
     }
 
     match list.output() {
@@ -859,7 +878,7 @@ pub fn phash64_cached(path: &Path, thumbs_dir: &Path) -> Option<u64> {
 
 /// Absolute path of the cached thumbnail for `path` inside `out_dir`.
 pub fn thumbnail_path(path: &Path, out_dir: &Path) -> PathBuf {
-    let hash = fnv1a(path.to_string_lossy().as_bytes());
+    let hash = crate::util::fnv1a_64(path.to_string_lossy().as_bytes());
     out_dir.join(format!("{:016x}.jpg", hash))
 }
 
@@ -890,7 +909,7 @@ pub fn thumbnail(path: &Path, out_dir: &Path) -> Option<PathBuf> {
     ));
 
     let result = (|| -> Option<()> {
-        let rgb = image.thumbnail(THUMB_SIZE, THUMB_SIZE).to_rgb8();
+        let rgb = to_rgb8_composited(&image.thumbnail(THUMB_SIZE, THUMB_SIZE), [255, 255, 255]);
         let mut writer = BufWriter::new(File::create(&temp).ok()?);
         let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut writer, 80);
         encoder
@@ -944,15 +963,6 @@ fn is_fresh(target: &Path, source: &Path) -> bool {
         (Ok(target_time), Ok(source_time)) => target_time >= source_time,
         _ => false,
     }
-}
-
-fn fnv1a(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for &byte in bytes {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
 }
 
 #[cfg(test)]

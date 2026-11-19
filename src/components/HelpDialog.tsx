@@ -1,6 +1,7 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { X } from "lucide-react";
+import { useFocusTrap } from "../lib/useFocusTrap";
 
 const KEYS = [
   { combo: "Alt+Space", key: "showHide" },
@@ -36,6 +37,10 @@ const FILTERS = [
 
 export function HelpDialog({ onClose }: { onClose: () => void }) {
   const { t } = useTranslation("help");
+  const { t: tc } = useTranslation("common");
+  const dialogRef = useRef<HTMLDivElement>(null);
+  useFocusTrap(dialogRef);
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape" || e.key === "?") {
@@ -48,13 +53,25 @@ export function HelpDialog({ onClose }: { onClose: () => void }) {
   }, [onClose]);
 
   return (
-    <div className="fade-in fixed inset-0 z-50 flex items-center justify-center bg-scrim p-6 backdrop-blur-[6px]">
-      <div className="elevated overlay-in max-h-[80vh] w-full max-w-2xl overflow-y-auto rounded-sheet p-6">
+    <div
+      className="fade-in fixed inset-0 z-50 flex items-center justify-center bg-scrim p-6 backdrop-blur-[6px]"
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-label={t("title")}
+        className="elevated overlay-in max-h-[80vh] w-full max-w-2xl overflow-y-auto rounded-sheet p-6"
+      >
         <div className="flex items-center justify-between pb-3">
           <h2 className="t-title text-fg">{t("title")}</h2>
           <button
             type="button"
             onClick={onClose}
+            aria-label={tc("actions.close")}
             className="btn btn-ghost btn-icon h-8 !rounded-full"
           >
             <X className="h-4 w-4" />

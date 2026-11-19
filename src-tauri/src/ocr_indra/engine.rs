@@ -257,8 +257,14 @@ impl Engine {
             plan.push((None, all));
         }
 
+        let mut tried_base = vec![false; crops.len()];
         let mut best: Vec<Reading> = vec![(String::new(), -1.0); crops.len()];
         for (group, lines) in plan {
+            if group.is_none() {
+                for &j in &lines {
+                    tried_base[j] = true;
+                }
+            }
             let src = if group.is_none() && self.window > 1 { &tall } else { &crops };
             let widths: Vec<usize> = lines.iter().map(|&j| crops[j].w).collect();
             for part in width_batches(&widths) {
@@ -272,16 +278,17 @@ impl Engine {
                     None => (&mut self.rec, &self.vocab),
                 };
                 for (j, (ids, conf)) in idx.iter().zip(run_ctc(session, &batch)?) {
-                    if conf <= best[*j].1 {
+                    if conf < MIN_CONF || conf <= best[*j].1 {
                         continue;
                     }
-                    let text = if conf < MIN_CONF {
-                        String::new()
-                    } else if group.is_some() {
+                    let text = if group.is_some() {
                         vocab.decode_chars(&ids)
                     } else {
                         vocab.decode(&ids)
                     };
+                    if text.trim().is_empty() {
+                        continue;
+                    }
                     best[*j] = (text, conf);
                 }
             }
@@ -292,7 +299,7 @@ impl Engine {
         // full Cyrillic, Latin, Greek, math, and punctuation. This ensures misrouted
         // or out-of-vocabulary scripts are never silently dropped.
         let empty_lines: Vec<usize> = (0..crops.len())
-            .filter(|&j| best[j].0.trim().is_empty())
+            .filter(|&j| !tried_base[j] && best[j].0.trim().is_empty())
             .collect();
         if !empty_lines.is_empty() {
             let src = if self.window > 1 { &tall } else { &crops };

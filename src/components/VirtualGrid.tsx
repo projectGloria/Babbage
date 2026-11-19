@@ -150,7 +150,7 @@ export function VirtualGrid<T>({
   }
 
   return (
-    <div ref={setRefs} onScroll={onScroll} className="relative min-h-0 flex-1 overflow-y-auto">
+    <div ref={setRefs} role="listbox" onScroll={onScroll} className="relative min-h-0 flex-1 overflow-y-auto">
       <div style={{ height: contentHeight, position: "relative" }}>{rows}</div>
       {loading && (
         <div className="pointer-events-none sticky bottom-3 flex justify-center">

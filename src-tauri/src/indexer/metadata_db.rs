@@ -338,12 +338,18 @@ impl MetadataDb {
                     "DELETE FROM units WHERE node_id IN (SELECT id FROM nodes WHERE path = ?1)",
                 )
                 .map_err(|e| e.to_string())?;
+            let mut visual_units = sp
+                .prepare_cached(
+                    "DELETE FROM visual_units WHERE node_id IN (SELECT id FROM nodes WHERE path = ?1)",
+                )
+                .map_err(|e| e.to_string())?;
             let mut nodes = sp
                 .prepare_cached("DELETE FROM nodes WHERE path = ?1")
                 .map_err(|e| e.to_string())?;
             for path in paths {
                 let path_str = path.to_string_lossy();
                 let _ = units.execute(params![path_str.as_ref()]);
+                let _ = visual_units.execute(params![path_str.as_ref()]);
                 nodes
                     .execute(params![path_str.as_ref()])
                     .map_err(|e| format!("Failed to delete metadata entry: {}", e))?;
@@ -358,6 +364,11 @@ impl MetadataDb {
         let path_str = path.to_string_lossy().to_string();
         if let Ok(mut stmt) = conn.prepare_cached(
             "DELETE FROM units WHERE node_id IN (SELECT id FROM nodes WHERE path = ?1)",
+        ) {
+            let _ = stmt.execute(params![path_str]);
+        }
+        if let Ok(mut stmt) = conn.prepare_cached(
+            "DELETE FROM visual_units WHERE node_id IN (SELECT id FROM nodes WHERE path = ?1)",
         ) {
             let _ = stmt.execute(params![path_str]);
         }
@@ -407,6 +418,14 @@ impl MetadataDb {
 
         for path in &all_paths {
             if path == &new_str || path.starts_with(&new_prefix) {
+                let _ = tx.execute(
+                    "DELETE FROM units WHERE node_id IN (SELECT id FROM nodes WHERE path = ?1)",
+                    params![path],
+                );
+                let _ = tx.execute(
+                    "DELETE FROM visual_units WHERE node_id IN (SELECT id FROM nodes WHERE path = ?1)",
+                    params![path],
+                );
                 tx.execute("DELETE FROM nodes WHERE path = ?1", params![path])
                     .map_err(|e| format!("Failed to clear destination path: {}", e))?;
             }
@@ -430,13 +449,18 @@ impl MetadataDb {
                 .map_err(|e| format!("Failed to rename node path: {}", e))?;
         }
 
-        // Only the moved root changes its display name; descendants keep theirs.
+        // Only the moved root changes its display name (and extension if a file);
+        // descendants keep theirs.
         if moved > 0
             && let Some(name) = new.file_name()
         {
+            let new_ext = new
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|s| s.to_lowercase());
             tx.execute(
-                "UPDATE nodes SET name = ?1 WHERE path = ?2",
-                params![name.to_string_lossy().to_string(), new_str],
+                "UPDATE nodes SET name = ?1, extension = CASE WHEN is_dir = 0 THEN ?2 ELSE extension END WHERE path = ?3",
+                params![name.to_string_lossy().to_string(), new_ext, new_str],
             )
             .map_err(|e| format!("Failed to rename node: {}", e))?;
         }
@@ -449,6 +473,7 @@ impl MetadataDb {
     pub fn clear(&self) -> Result<(), String> {
         let conn = self.conn.lock();
         let _ = conn.prepare_cached("DELETE FROM units").and_then(|mut stmt| stmt.execute([]));
+        let _ = conn.prepare_cached("DELETE FROM visual_units").and_then(|mut stmt| stmt.execute([]));
         let _ = conn.prepare_cached("DELETE FROM usage").and_then(|mut stmt| stmt.execute([]));
         conn.prepare_cached("DELETE FROM nodes").and_then(|mut stmt| stmt.execute([]))
             .map_err(|e| format!("Failed to clear metadata: {}", e))?;
@@ -655,6 +680,71 @@ impl MetadataDb {
                 .map_err(|e| format!("Failed to delete units for nodes: {}", e))?;
         }
         Ok(())
+    }
+
+    /// Atomically replaces semantic units for `nodes` and marks them
+    /// `indexed_gen = 1` inside a single SQLite transaction.
+    ///
+    /// Returns the assigned row ID for each unit in `units`.
+    pub fn write_embedding_batch(
+        &self,
+        nodes: &[(u64, String)],
+        units: &[(u64, usize, usize, u32, Vec<i8>)],
+    ) -> Result<Vec<u64>, String> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| format!("Failed to begin embedding batch tx: {}", e))?;
+
+        for chunk in nodes.chunks(500) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!("DELETE FROM units WHERE node_id IN ({})", placeholders);
+            let mut stmt = tx
+                .prepare(&sql)
+                .map_err(|e| format!("Failed to prepare batch unit delete: {}", e))?;
+            let params: Vec<i64> = chunk.iter().map(|(id, _)| *id as i64).collect();
+            stmt.execute(rusqlite::params_from_iter(params))
+                .map_err(|e| format!("Failed to delete batch units: {}", e))?;
+        }
+
+        let mut inserted_ids = Vec::with_capacity(units.len());
+        {
+            let mut insert_stmt = tx
+                .prepare_cached(
+                    "INSERT INTO units (node_id, byte_start, byte_end, model_id, vec) VALUES (?1, ?2, ?3, ?4, ?5)",
+                )
+                .map_err(|e| format!("Failed to prepare batch unit insert: {}", e))?;
+            for (node_id, byte_start, byte_end, model_id, vec) in units {
+                let u8_vec: Vec<u8> = vec.iter().map(|&b| b as u8).collect();
+                insert_stmt
+                    .execute(params![
+                        *node_id as i64,
+                        *byte_start as i64,
+                        *byte_end as i64,
+                        *model_id as i64,
+                        u8_vec,
+                    ])
+                    .map_err(|e| format!("Failed to insert batch unit: {}", e))?;
+                inserted_ids.push(tx.last_insert_rowid() as u64);
+            }
+        }
+
+        {
+            let mut gen_stmt = tx
+                .prepare_cached("UPDATE nodes SET indexed_gen = 1, content_hash = ?1 WHERE id = ?2")
+                .map_err(|e| format!("Failed to prepare indexed_gen update: {}", e))?;
+            for (node_id, content_hash) in nodes {
+                gen_stmt
+                    .execute(params![content_hash, *node_id as i64])
+                    .map_err(|e| format!("Failed to update indexed_gen: {}", e))?;
+            }
+        }
+
+        tx.commit()
+            .map_err(|e| format!("Failed to commit embedding batch tx: {}", e))?;
+        Ok(inserted_ids)
     }
 
     pub fn save_visual_unit(
@@ -1042,7 +1132,7 @@ impl MetadataDb {
         else {
             return Ok(Vec::new());
         };
-        if raw_phash < 0 {
+        if raw_phash == -1 {
             return Ok(Vec::new());
         }
         let phash = raw_phash as u64;
@@ -1091,7 +1181,7 @@ impl MetadataDb {
         for (candidate_id, candidate_path, candidate_phash, candidate_sig, candidate_burst) in
             candidates
         {
-            if candidate_phash < 0 || Path::new(&candidate_path).parent() != Some(parent.as_path())
+            if candidate_phash == -1 || Path::new(&candidate_path).parent() != Some(parent.as_path())
             {
                 continue;
             }

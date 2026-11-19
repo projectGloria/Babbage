@@ -11,14 +11,11 @@
 //! callers translate into the hashing fallback in [`crate::embed::model`].
 
 use crate::embed::model::EMBEDDING_DIM;
+use crate::embed::wordpiece::{WordPieceTokenizer, l2_normalize};
 use serde_json::Value;
-use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
-
-/// Hard cap on the number of WordPiece ids returned per text.
-pub const MAX_TOKENS: usize = 512;
 
 /// Upper bound for the safetensors JSON header. Real headers are a few KB;
 /// this only exists so a corrupt length prefix cannot allocate gigabytes.
@@ -33,14 +30,10 @@ pub struct StaticTable {
     /// Quantized row-major matrix (default). One scale per row.
     pub embeddings_i8: Vec<i8>,
     pub embedding_scales: Vec<f32>,
-    pub vocab: HashMap<String, u32>,
+    pub tokenizer: WordPieceTokenizer,
     pub dim: usize,
-    pub unknown_id: u32,
-    pub lowercase: bool,
     pub normalize: bool,
     pub model_id: u32,
-    continuing_prefix: String,
-    max_input_chars: usize,
 }
 
 impl StaticTable {
@@ -118,7 +111,7 @@ impl StaticTable {
             .map_err(|e| format!("cannot read {}: {e}", tokenizer_path.display()))?;
         let tokenizer: Value = serde_json::from_slice(&tokenizer_bytes)
             .map_err(|_| format!("{} is not valid JSON", tokenizer_path.display()))?;
-        let tokenizer_parts = parse_tokenizer(&tokenizer, vocab_size).ok_or_else(|| {
+        let tokenizer = WordPieceTokenizer::parse_bounded(&tokenizer, vocab_size).ok_or_else(|| {
             format!(
                 "{} does not match the matrix vocabulary ({vocab_size} rows)",
                 tokenizer_path.display()
@@ -169,14 +162,10 @@ impl StaticTable {
             embeddings,
             embeddings_i8,
             embedding_scales,
-            vocab: tokenizer_parts.vocab,
+            tokenizer,
             dim,
-            unknown_id: tokenizer_parts.unknown_id,
-            lowercase: tokenizer_parts.lowercase,
             normalize,
             model_id: crate::embed::model::REAL_MODEL_ID,
-            continuing_prefix: tokenizer_parts.continuing_prefix,
-            max_input_chars: tokenizer_parts.max_input_chars,
         })
     }
 
@@ -194,15 +183,7 @@ impl StaticTable {
 
     /// Encodes `text` to WordPiece ids, without any special tokens.
     pub fn token_ids(&self, text: &str) -> Vec<u32> {
-        let mut ids = Vec::new();
-        for word in self.pre_tokenize(text) {
-            self.tokenize_word(&word, &mut ids);
-            if ids.len() >= MAX_TOKENS {
-                ids.truncate(MAX_TOKENS);
-                break;
-            }
-        }
-        ids
+        self.tokenizer.token_ids(text)
     }
 
     /// Mean-pools token embedding rows, then L2-normalizes when configured.
@@ -250,86 +231,6 @@ impl StaticTable {
         out
     }
 
-    /// BERT-ish normalization + pre-tokenization: lowercase, drop control
-    /// characters, collapse whitespace, and isolate punctuation and CJK.
-    fn pre_tokenize(&self, text: &str) -> Vec<String> {
-        let mut words = Vec::new();
-        let mut current = String::new();
-
-        for ch in text.chars() {
-            if ch.is_whitespace() {
-                if !current.is_empty() {
-                    words.push(std::mem::take(&mut current));
-                }
-            } else if ch.is_control() {
-                continue;
-            } else if is_punctuation(ch) || is_cjk(ch) {
-                if !current.is_empty() {
-                    words.push(std::mem::take(&mut current));
-                }
-                words.push(lowercase_char(ch, self.lowercase));
-            } else if self.lowercase {
-                current.extend(ch.to_lowercase());
-            } else {
-                current.push(ch);
-            }
-        }
-        if !current.is_empty() {
-            words.push(current);
-        }
-        words
-    }
-
-    /// Greedy longest-match WordPiece with the `##` continuation prefix.
-    fn tokenize_word(&self, word: &str, ids: &mut Vec<u32>) {
-        if word.is_empty() {
-            return;
-        }
-
-        // Fast path: the whole word is a token.
-        if let Some(&id) = self.vocab.get(word) {
-            ids.push(id);
-            return;
-        }
-
-        let chars: Vec<char> = word.chars().collect();
-        if chars.len() > self.max_input_chars {
-            ids.push(self.unknown_id);
-            return;
-        }
-
-        let mut start = 0usize;
-        let mut pieces = Vec::new();
-        while start < chars.len() {
-            let mut end = chars.len();
-            let mut matched: Option<u32> = None;
-            while end > start {
-                let mut piece: String = chars[start..end].iter().collect();
-                if start > 0 {
-                    piece.insert_str(0, &self.continuing_prefix);
-                }
-                if let Some(&id) = self.vocab.get(&piece) {
-                    matched = Some(id);
-                    break;
-                }
-                end -= 1;
-            }
-
-            match matched {
-                Some(id) => {
-                    pieces.push(id);
-                    start = end;
-                }
-                None => {
-                    // A single unmatched character invalidates the whole word.
-                    ids.push(self.unknown_id);
-                    return;
-                }
-            }
-        }
-        ids.extend(pieces);
-    }
-
     #[cfg(test)]
     fn test_table(embeddings: Vec<f32>, vocab: &[(&str, u32)], dim: usize) -> Self {
         let (embeddings_i8, embedding_scales) = quantize(&embeddings, dim);
@@ -337,14 +238,18 @@ impl StaticTable {
             embeddings: Vec::new(),
             embeddings_i8,
             embedding_scales,
-            vocab: vocab.iter().map(|(t, id)| (t.to_string(), *id)).collect(),
+            tokenizer: WordPieceTokenizer {
+                vocab: vocab.iter().map(|(t, id)| (t.to_string(), *id)).collect(),
+                unknown_id: 1,
+                cls_id: 101,
+                sep_id: 102,
+                lowercase: true,
+                continuing_prefix: "##".to_string(),
+                max_input_chars: 100,
+            },
             dim,
-            unknown_id: 1,
-            lowercase: true,
             normalize: true,
             model_id: crate::embed::model::REAL_MODEL_ID,
-            continuing_prefix: "##".to_string(),
-            max_input_chars: 100,
         }
     }
 
@@ -354,43 +259,20 @@ impl StaticTable {
             embeddings,
             embeddings_i8: Vec::new(),
             embedding_scales: Vec::new(),
-            vocab: vocab.iter().map(|(t, id)| (t.to_string(), *id)).collect(),
+            tokenizer: WordPieceTokenizer {
+                vocab: vocab.iter().map(|(t, id)| (t.to_string(), *id)).collect(),
+                unknown_id: 1,
+                cls_id: 101,
+                sep_id: 102,
+                lowercase: true,
+                continuing_prefix: "##".to_string(),
+                max_input_chars: 100,
+            },
             dim,
-            unknown_id: 1,
-            lowercase: true,
             normalize: true,
             model_id: crate::embed::model::REAL_MODEL_ID,
-            continuing_prefix: "##".to_string(),
-            max_input_chars: 100,
         }
     }
-}
-
-fn lowercase_char(ch: char, lowercase: bool) -> String {
-    if lowercase {
-        ch.to_lowercase().collect()
-    } else {
-        ch.to_string()
-    }
-}
-
-/// BERT's punctuation definition (ASCII ranges), which is what
-/// `BertPreTokenizer` splits on.
-fn is_punctuation(ch: char) -> bool {
-    ch.is_ascii_punctuation()
-}
-
-/// `BertNormalizer` surrounds CJK ideographs/kana/hangul with spaces so each
-/// becomes its own pre-token. Roughly mirrors `handle_chinese_chars`.
-fn is_cjk(ch: char) -> bool {
-    matches!(
-        ch as u32,
-        0x3040..=0x30FF       // hiragana + katakana
-            | 0x3400..=0x4DBF // CJK extension A
-            | 0x4E00..=0x9FFF // CJK unified ideographs
-            | 0xAC00..=0xD7AF // hangul syllables
-            | 0xF900..=0xFAFF // CJK compatibility ideographs
-    )
 }
 
 /// Quantizes a row-major f32 matrix to i8 with one symmetric scale per row.
@@ -415,78 +297,6 @@ fn quantize(embeddings: &[f32], dim: usize) -> (Vec<i8>, Vec<f32>) {
         }
     }
     (out, scales)
-}
-
-fn l2_normalize(values: &mut [f32]) {
-    let norm_sq: f32 = values.iter().map(|v| v * v).sum();
-    if norm_sq > 0.0 {
-        let norm = norm_sq.sqrt();
-        for value in values {
-            *value /= norm;
-        }
-    }
-}
-
-struct TokenizerParts {
-    vocab: HashMap<String, u32>,
-    unknown_id: u32,
-    lowercase: bool,
-    continuing_prefix: String,
-    max_input_chars: usize,
-}
-
-fn parse_tokenizer(value: &Value, vocab_size: usize) -> Option<TokenizerParts> {
-    let model = value.get("model")?;
-    let vocab_object = model.get("vocab")?.as_object()?;
-
-    let mut vocab = HashMap::with_capacity(vocab_object.len());
-    for (token, id) in vocab_object {
-        let Some(id) = id.as_u64() else { continue };
-        if (id as usize) < vocab_size {
-            vocab.insert(token.clone(), id as u32);
-        }
-    }
-    if vocab.is_empty() {
-        return None;
-    }
-
-    let unk_token = model
-        .get("unk_token")
-        .and_then(|v| v.as_str())
-        .unwrap_or("[UNK]");
-    let unknown_id = vocab.get(unk_token).copied().unwrap_or(0);
-    if unknown_id as usize >= vocab_size {
-        return None;
-    }
-
-    let continuing_prefix = model
-        .get("continuing_subword_prefix")
-        .and_then(|v| v.as_str())
-        .unwrap_or("##")
-        .to_string();
-    let max_input_chars = model
-        .get("max_input_chars_per_word")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(100) as usize;
-
-    let normalizer = value.get("normalizer");
-    let lowercase = normalizer
-        .and_then(|n| n.get("lowercase"))
-        .and_then(|v| v.as_bool())
-        .or_else(|| {
-            normalizer
-                .and_then(|n| n.get("do_lower_case"))
-                .and_then(|v| v.as_bool())
-        })
-        .unwrap_or(true);
-
-    Some(TokenizerParts {
-        vocab,
-        unknown_id,
-        lowercase,
-        continuing_prefix,
-        max_input_chars,
-    })
 }
 
 /// Parses one safetensors file and returns `(embeddings, vocab_size, dim)`.
@@ -1025,7 +835,7 @@ mod real_model_validation {
         let i8_table = StaticTable::load_with_f32(path, false).expect("i8 table");
         println!(
             "K14 real model: vocab={} dim={} f32_matrix_bytes={} i8_matrix_bytes={} scales_bytes={}",
-            f32_table.vocab.len(),
+            f32_table.tokenizer.vocab.len(),
             f32_table.dim,
             f32_table.embeddings.len() * std::mem::size_of::<f32>(),
             i8_table.embeddings_i8.len(),

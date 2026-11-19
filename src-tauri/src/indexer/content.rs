@@ -830,7 +830,7 @@ impl ContentIndex {
             let sanitized = if contains_near(text) {
                 rewrite_near_in_group(text)
             } else {
-                sanitize_query_text(text)
+                sanitize_group_text(text)
             };
             if sanitized.trim().is_empty() {
                 continue;
@@ -842,8 +842,8 @@ impl ContentIndex {
             };
             let mut parser = QueryParser::for_index(&self.index, fields);
             parser.set_conjunction_by_default();
-            // `sanitize_query_text` removes every parser metacharacter, so this
-            // should always succeed; skip the group if it somehow does not.
+            // `sanitize_group_text` removes every parser metacharacter (while
+            // preserving phrase quotes), so this should always succeed.
             if let Ok(parsed) = parser.parse_query(&sanitized) {
                 plain_clauses.push((Occur::Must, parsed));
             }
@@ -859,6 +859,45 @@ impl ContentIndex {
                     "Regex pattern too long (max {} characters); ignored",
                     MAX_REGEX_PATTERN_LEN
                 ));
+                continue;
+            }
+
+            // Default aliases expand into `(?i)(alt1|alt2|...)` where multi-word
+            // entries like `curriculum vitae` cannot match a single inverted-index
+            // token in Tantivy's RegexQuery; split those out into Should PhraseQueries.
+            if let Some(inner) = pattern
+                .strip_prefix("(?i)(")
+                .and_then(|s| s.strip_suffix(')'))
+                && inner.split('|').any(|alt| alt.split_whitespace().count() > 1)
+            {
+                let mut single_alts = Vec::new();
+                for alt in inner.split('|') {
+                    let clean_alt = alt.replace('\\', "");
+                    if clean_alt.split_whitespace().count() > 1 {
+                        let phrase = sanitize_query_text(&clean_alt);
+                        let phrase_trimmed = phrase.trim();
+                        if !phrase_trimmed.is_empty() {
+                            let parser = QueryParser::for_index(
+                                &self.index,
+                                vec![self.filename_field, self.content_field],
+                            );
+                            if let Ok(q) = parser.parse_query(&format!("\"{}\"", phrase_trimmed)) {
+                                regex_clauses.push((Occur::Should, q));
+                            }
+                        }
+                    } else if !alt.is_empty() {
+                        single_alts.push(alt);
+                    }
+                }
+                if single_alts.is_empty() {
+                    continue;
+                }
+                let single_pat = format!("(?i)({})", single_alts.join("|"));
+                for field in [self.content_field, self.filename_field] {
+                    if let Ok(query) = RegexQuery::from_pattern(&single_pat, field) {
+                        regex_clauses.push((Occur::Should, Box::new(query)));
+                    }
+                }
                 continue;
             }
 
@@ -1249,11 +1288,10 @@ impl ContentIndex {
 
     pub fn extract_snippet_from_text_cached(
         content: &str,
-        content_lower: &str,
+        _content_lower: &str,
         query: &str,
     ) -> Option<String> {
-        let query_lower = query.to_lowercase();
-        let terms: Vec<&str> = query_lower.split_whitespace().collect();
+        let terms: Vec<&str> = query.split_whitespace().collect();
         if terms.is_empty() {
             return None;
         }
@@ -1261,7 +1299,12 @@ impl ContentIndex {
         let mut first_match_idx = None;
 
         for term in &terms {
-            if let Some(pos) = content_lower.find(term) {
+            if let Ok(re) = regex::RegexBuilder::new(&regex::escape(term))
+                .case_insensitive(true)
+                .build()
+                && let Some(m) = re.find(content)
+            {
+                let pos = m.start();
                 first_match_idx = match first_match_idx {
                     Some(cur) => Some(std::cmp::min(cur, pos)),
                     None => Some(pos),
@@ -1513,7 +1556,6 @@ pub fn is_indexable_extension(ext_opt: Option<&str>) -> bool {
         "odp",
         "rtf",
         "pages",
-        "key",
         "numbers",
         "png",
         "jpg",
@@ -1537,7 +1579,6 @@ pub fn is_indexable_file_name(name: &str) -> bool {
             | "cargo.toml"
             | "package.json"
             | ".gitignore"
-            | ".env"
             | ".editorconfig"
     )
 }
@@ -1551,6 +1592,22 @@ pub fn read_text_content(path: &Path, max_bytes: u64) -> Option<String> {
 pub fn read_text_content_checked(path: &Path, max_bytes: u64) -> (Option<String>, bool) {
     let (document, retry) = crate::indexer::extract::extract_document_checked(path, max_bytes);
     (document.map(|doc| doc.text), retry)
+}
+
+/// Sanitizes a group string while preserving explicit double-quoted phrase delimiters.
+fn sanitize_group_text(text: &str) -> String {
+    let trimmed = text.trim();
+    if let Some(inner) = trimmed.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+        let clean = sanitize_query_text(inner);
+        let clean = clean.trim();
+        if clean.is_empty() {
+            String::new()
+        } else {
+            format!("\"{}\"", clean)
+        }
+    } else {
+        sanitize_query_text(text)
+    }
 }
 
 /// Defuses QueryParser metacharacters in user-supplied text.

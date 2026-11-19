@@ -57,6 +57,19 @@ export function classify(result: { is_dir: boolean; filename: string }): Categor
   return "file";
 }
 
+export function matchesCategory(
+  result: { is_dir: boolean; filename: string; modified: number },
+  id: string,
+  nowSec = Date.now() / 1000,
+): boolean {
+  if (id === "all") return true;
+  if (id === "file") return !result.is_dir;
+  if (id === "recent") {
+    return !result.is_dir && result.modified > 0 && nowSec - result.modified <= 7 * 86400;
+  }
+  return classify(result) === id;
+}
+
 /** Client-side counts per chip, for the badge in the chip row. */
 export function categoryCounts(results: SearchResult[]): Record<string, number> {
   const counts: Record<string, number> = { all: results.length, recent: 0 };

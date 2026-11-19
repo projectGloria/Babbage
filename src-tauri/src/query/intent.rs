@@ -328,57 +328,58 @@ pub fn compile_with_aliases(raw: &str, aliases: &[(String, Vec<String>)]) -> Int
             }
         }
 
+        // --- Personal vocabulary --------------------------------------
+        for (term, expansions) in aliases {
+            let term = term.trim();
+            if term.is_empty() {
+                continue;
+            }
+            let Ok(re) = cached_regex(&format!(r"(?i)\b{}\b", regex::escape(term))) else {
+                continue;
+            };
+            if !re.is_match(&work) {
+                continue;
+            }
+            let mut words = vec![term.to_lowercase()];
+            for exp in expansions {
+                let exp = exp.trim().to_lowercase();
+                if !exp.is_empty() && !words.contains(&exp) {
+                    words.push(exp);
+                }
+            }
+            let alternation = words
+                .iter()
+                .map(|w| regex::escape(w))
+                .collect::<Vec<_>>()
+                .join("|");
+            let raw = format!("re:\"(?i)({})\"", alternation);
+            // Keep `term` in `work` so Tier 1 (fuzzy filename), Tier 3 (semantic),
+            // and Tier 3b (visual) search continue running alongside the alias expansion.
+            appends.push(raw.clone());
+            chips.push(InterpretationChip {
+                kind: "alias".to_string(),
+                label: format!("Alias: {}", term),
+                raw,
+                source: term.to_string(),
+            });
+        }
+
         // --- Place ------------------------------------------------------
         if let Ok(re) = cached_regex(
             r"(?i)\bin\s+(?:my\s+)?(projects|downloads|documents|desktop|pictures|videos|music|work)\b",
-        ) {
-            // --- Personal vocabulary ----------------------------------
-            for (term, expansions) in aliases {
-                let term = term.trim();
-                if term.is_empty() {
-                    continue;
-                }
-                let Ok(re) = cached_regex(&format!(r"(?i)\b{}\b", regex::escape(term))) else {
-                    continue;
-                };
-                if !re.is_match(&work) {
-                    continue;
-                }
-                let mut words = vec![term.to_lowercase()];
-                for exp in expansions {
-                    let exp = exp.trim().to_lowercase();
-                    if !exp.is_empty() && !words.contains(&exp) {
-                        words.push(exp);
-                    }
-                }
-                let alternation = words
-                    .iter()
-                    .map(|w| regex::escape(w))
-                    .collect::<Vec<_>>()
-                    .join("|");
-                let raw = format!("re:\"(?i)({})\"", alternation);
-                work = re.replace(&work, " ").to_string();
-                appends.push(raw.clone());
-                chips.push(InterpretationChip {
-                    kind: "alias".to_string(),
-                    label: format!("Alias: {}", term),
-                    raw,
-                    source: term.to_string(),
-                });
-            }
-            if let Some(c) = re.captures(&work) {
-                let place = c[1].to_string();
-                let raw = format!("in:{}", place);
-                let source = c.get(0).map(|m| m.as_str().to_string()).unwrap_or_default();
-                work = re.replace(&work, " ").to_string();
-                appends.push(raw.clone());
-                chips.push(InterpretationChip {
-                    kind: "place".to_string(),
-                    label: format!("In: {}", place),
-                    raw,
-                    source,
-                });
-            }
+        ) && let Some(c) = re.captures(&work)
+        {
+            let place = c[1].to_string();
+            let raw = format!("in:{}", place);
+            let source = c.get(0).map(|m| m.as_str().to_string()).unwrap_or_default();
+            work = re.replace(&work, " ").to_string();
+            appends.push(raw.clone());
+            chips.push(InterpretationChip {
+                kind: "place".to_string(),
+                label: format!("In: {}", place),
+                raw,
+                source,
+            });
         }
     }
 

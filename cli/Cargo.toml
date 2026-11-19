@@ -1,6 +1,6 @@
 [package]
 name = "babbage-cli"
-version = "1.0.5"
+version = "1.0.16"
 edition = "2024"
 description = "Agent-facing CLI and MCP server for Babbage"
 license = "MIT"

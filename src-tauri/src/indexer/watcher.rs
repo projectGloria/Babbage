@@ -84,12 +84,15 @@ impl PendingUpserts {
     }
 
     fn due(&mut self, now: Instant) -> Vec<(PathBuf, PendingUpsert)> {
-        let ready: Vec<PathBuf> = self
+        let mut ready: Vec<PathBuf> = self
             .paths
             .iter()
             .filter(|(_, pending)| pending.deadline <= now)
             .map(|(path, _)| path.clone())
             .collect();
+        // Process shallow parent directories before nested files so newly
+        // created children resolve their parent index properly.
+        ready.sort_by_key(|p| p.components().count());
         ready
             .into_iter()
             .filter_map(|path| self.paths.remove(&path).map(|pending| (path, pending)))
@@ -499,14 +502,21 @@ fn is_path_excluded(path: &Path, cfg: &BabbageConfig) -> bool {
     if crate::indexer::ignore::is_active_ignored(path, path.is_dir()) {
         return true;
     }
+    if !path.is_dir() && cfg.is_extension_excluded(path) {
+        return true;
+    }
     path.components().any(|component| {
         component
             .as_os_str()
             .to_str()
             .map(|name| {
-                // Hidden/dot entries are never indexed by default.
-                // TODO: honor `cfg.skip_hidden` once it is wired through.
-                cfg.skip_hidden && name.starts_with('.') || cfg.is_dir_excluded(name)
+                let is_sensitive = crate::indexer::walker::SENSITIVE_NAMES
+                    .iter()
+                    .any(|s| name.eq_ignore_ascii_case(s));
+                // Hidden/dot entries and sensitive directories are excluded.
+                is_sensitive
+                    || (cfg.skip_hidden && name.starts_with('.'))
+                    || cfg.is_dir_excluded(name)
             })
             .unwrap_or(false)
     })
@@ -652,6 +662,7 @@ fn handle_directory_rename(
     let new_dir = new_path.to_path_buf();
     let excluded_dirs = cfg.excluded_dirs.clone();
     let include_ignored = cfg.include_ignored;
+    let cfg_clone = cfg.clone();
     let metadata = Arc::clone(metadata);
     let content_index = Arc::clone(content_index);
 
@@ -699,6 +710,9 @@ fn handle_directory_rename(
 
         for entry in entries {
             if moved.contains(&entry.path) {
+                continue;
+            }
+            if !entry.is_dir && cfg_clone.is_extension_excluded(&entry.path) {
                 continue;
             }
             let is_indexable = !entry.is_dir

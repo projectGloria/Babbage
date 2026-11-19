@@ -111,31 +111,40 @@ impl DirectoryTrie {
             });
         }
 
-        // Try matching path suffix / relative path
+        // Try matching path suffix / relative path only when the target contains '/'.
         let target_norm = trimmed.replace('\\', "/").to_lowercase();
         let target_clean = target_norm.trim_end_matches('/');
 
-        let mut path_matches = Vec::new();
-        for (idx, entry) in entries.iter().enumerate() {
-            if entry.is_dir {
-                let entry_path_str = entry
-                    .path
-                    .to_string_lossy()
-                    .replace('\\', "/")
-                    .to_lowercase();
-                if entry_path_str.ends_with(target_clean) {
-                    path_matches.push(ScopeResolution {
-                        dir_idx: idx,
-                        path: entry.path.clone(),
-                    });
+        if target_clean.contains('/') {
+            let suffix_with_slash = format!("/{}", target_clean);
+            let mut path_matches = Vec::new();
+            for (idx, entry) in entries.iter().enumerate() {
+                if entry.is_dir {
+                    let entry_path_str = entry
+                        .path
+                        .to_string_lossy()
+                        .replace('\\', "/")
+                        .to_lowercase();
+                    let matches_subpath = if target_clean.starts_with('/') {
+                        entry_path_str.ends_with(target_clean)
+                    } else {
+                        entry_path_str == target_clean
+                            || entry_path_str.ends_with(&suffix_with_slash)
+                    };
+                    if matches_subpath {
+                        path_matches.push(ScopeResolution {
+                            dir_idx: idx,
+                            path: entry.path.clone(),
+                        });
+                    }
                 }
             }
-        }
 
-        if path_matches.len() == 1 {
-            return TrieMatchResult::Single(path_matches.remove(0));
-        } else if path_matches.len() > 1 {
-            return TrieMatchResult::Ambiguous(path_matches);
+            if path_matches.len() == 1 {
+                return TrieMatchResult::Single(path_matches.remove(0));
+            } else if path_matches.len() > 1 {
+                return TrieMatchResult::Ambiguous(path_matches);
+            }
         }
 
         // 2. Trie match on directory name: exact > prefix > fuzzy

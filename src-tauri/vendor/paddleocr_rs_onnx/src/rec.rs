@@ -86,78 +86,60 @@ fn is_valid_quad(bbox: &[[f32; 2]; 4]) -> bool {
 
 /// Order bounding box points as top-left, top-right, bottom-right, bottom-left.
 ///
-/// Uses sum/difference heuristics to identify corners.
-fn order_bbox_points(bbox: [[f32; 2]; 4]) -> [[f32; 2]; 4] {
-    let mut rect = [[0.0; 2]; 4];
+/// Sorts points by x into left/right pairs, then orders each pair by y so
+/// wide rotated quads do not collapse two corners onto the same point.
+fn order_bbox_points(mut bbox: [[f32; 2]; 4]) -> [[f32; 2]; 4] {
+    bbox.sort_by(|a, b| a[0].total_cmp(&b[0]).then_with(|| a[1].total_cmp(&b[1])));
 
-    let sums = bbox.map(|p| p[0] + p[1]);
-    let diffs = bbox.map(|p| p[0] - p[1]);
+    let (left0, left1) = (bbox[0], bbox[1]);
+    let (right0, right1) = (bbox[2], bbox[3]);
 
-    let top_left = sums
-        .iter()
-        .enumerate()
-        .min_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-        .map(|(idx, _)| idx)
-        .unwrap_or(0);
-    let bottom_right = sums
-        .iter()
-        .enumerate()
-        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-        .map(|(idx, _)| idx)
-        .unwrap_or(2);
+    let (top_left, bottom_left) = if left0[1].total_cmp(&left1[1]).is_le() {
+        (left0, left1)
+    } else {
+        (left1, left0)
+    };
+    let (top_right, bottom_right) = if right0[1].total_cmp(&right1[1]).is_le() {
+        (right0, right1)
+    } else {
+        (right1, right0)
+    };
 
-    let remaining: Vec<usize> = (0..4)
-        .filter(|idx| *idx != top_left && *idx != bottom_right)
-        .collect();
-
-    let top_right = remaining
-        .iter()
-        .copied()
-        .max_by(|a, b| diffs[*a].partial_cmp(&diffs[*b]).unwrap())
-        .unwrap_or(1);
-    let bottom_left = remaining
-        .iter()
-        .copied()
-        .min_by(|a, b| diffs[*a].partial_cmp(&diffs[*b]).unwrap())
-        .unwrap_or(3);
-
-    rect[0] = bbox[top_left];
-    rect[1] = bbox[top_right];
-    rect[2] = bbox[bottom_right];
-    rect[3] = bbox[bottom_left];
-    rect
+    [top_left, top_right, bottom_right, bottom_left]
 }
 
 /// Preprocess a text region for recognition.
-///
-/// Performs perspective rectification on the quadrilateral bounding box,
-/// resizes the result to the model's expected input dimensions, and
-/// normalizes pixel values.
-///
-/// # Arguments
-///
-/// * `image` — The original image.
-/// * `region` — The [`TextRegion`] to preprocess.
-/// * `rec_height` — Target height for the recognition model input.
-/// * `rec_width` — Optional fixed width; if `None`, width is computed from
-///   the aspect ratio of the rectified region.
-///
-/// # Returns
-///
-/// A tuple of `(flattened_chw_data, input_width)` where `flattened_chw_data`
-/// is the normalized CHW-format pixel data and `input_width` is the actual
-/// width used for the model input tensor.
-///
-/// # Errors
-///
-/// Returns [`PaddleOcrError::DegenerateRegion`] if the bounding box is invalid,
-/// or [`PaddleOcrError::Projection`] if the perspective transformation fails.
+#[allow(dead_code)]
 pub fn preprocess_region(
     image: &DynamicImage,
     region: &TextRegion,
     rec_height: u32,
     rec_width: Option<u32>,
 ) -> Result<(Vec<f32>, i64), PaddleOcrError> {
+    if !region.bbox.iter().flatten().all(|v| v.is_finite()) {
+        warn!("[rec] skipping non-finite bbox: {:?}", region.bbox);
+        return Err(PaddleOcrError::DegenerateRegion {
+            reason: "non-finite text region bbox".to_string(),
+        });
+    }
+    let rgb = image.to_rgb8();
+    preprocess_region_rgb(&rgb, region, rec_height, rec_width)
+}
+
+/// Preprocess a text region for recognition from an already-converted RGB buffer.
+pub fn preprocess_region_rgb(
+    rgb: &RgbImage,
+    region: &TextRegion,
+    rec_height: u32,
+    rec_width: Option<u32>,
+) -> Result<(Vec<f32>, i64), PaddleOcrError> {
+    if !region.bbox.iter().flatten().all(|v| v.is_finite()) {
+        warn!("[rec] skipping non-finite bbox: {:?}", region.bbox);
+        return Err(PaddleOcrError::DegenerateRegion {
+            reason: "non-finite text region bbox".to_string(),
+        });
+    }
+
     let bbox = order_bbox_points(region.bbox);
 
     // Reject degenerate quads that would produce an ill-conditioned homography
@@ -188,7 +170,6 @@ pub fn preprocess_region(
     let proj = Projection::from_control_points(src, dst)
         .ok_or(PaddleOcrError::Projection { reason: "Failed to create projection".to_string() })?;
 
-    let rgb = image.to_rgb8();
     let mut rectified = RgbImage::new(rw, rh);
 
     // Use Bilinear instead of Bicubic: bilinear samples a 2×2 neighbourhood
@@ -197,7 +178,7 @@ pub fn preprocess_region(
     // For OCR text rectification the quality difference is negligible.
     let warp_result = catch_unwind(AssertUnwindSafe(|| {
         warp_into(
-            &rgb,
+            rgb,
             proj,
             Interpolation::Bilinear,
             Border::Replicate,
@@ -313,7 +294,9 @@ pub fn run_recognition(
 
 #[cfg(test)]
 mod tests {
-    use super::{order_bbox_points, is_valid_quad, quad_area};
+    use super::{order_bbox_points, is_valid_quad, preprocess_region, quad_area};
+    use crate::{PaddleOcrError, TextRegion};
+    use image::{DynamicImage, RgbImage};
 
     #[test]
     fn orders_quad_points_clockwise_from_top_left() {
@@ -330,6 +313,33 @@ mod tests {
         assert_eq!(ordered[1], [30.0, 0.0]);
         assert_eq!(ordered[2], [30.0, 10.0]);
         assert_eq!(ordered[3], [0.0, 10.0]);
+    }
+
+    #[test]
+    fn orders_tilted_wide_quad_without_self_intersection() {
+        // 200x20 rectangle rotated by ~12 degrees
+        let angle = 12.0_f32.to_radians();
+        let (s, c) = angle.sin_cos();
+        let rot = |x: f32, y: f32| [100.0 + x * c - y * s, 100.0 + x * s + y * c];
+        let tl = rot(0.0, 0.0);
+        let tr = rot(200.0, 0.0);
+        let br = rot(200.0, 20.0);
+        let bl = rot(0.0, 20.0);
+
+        let ordered = order_bbox_points([br, tl, bl, tr]);
+        assert_eq!(ordered, [tl, tr, br, bl]);
+        assert!(is_valid_quad(&ordered));
+    }
+
+    #[test]
+    fn preprocess_region_rejects_nan_without_panicking() {
+        let img = DynamicImage::ImageRgb8(RgbImage::new(100, 100));
+        let region = TextRegion {
+            bbox: [[f32::NAN, 0.0], [50.0, 0.0], [50.0, 20.0], [0.0, 20.0]],
+            confidence: 0.9,
+        };
+        let err = preprocess_region(&img, &region, 48, None).unwrap_err();
+        assert!(matches!(err, PaddleOcrError::DegenerateRegion { .. }));
     }
 
     #[test]

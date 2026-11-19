@@ -219,10 +219,7 @@ impl MetadataStore {
         let existing = self.find_path_index(&entry.path);
         let idx = if let Some(idx) = existing {
             // preserve content_pending
-            let mut pending = self.arena.node(idx).content_pending();
-            if self.arena.node(idx).content_pending() {
-                pending = true;
-            }
+            let pending = self.arena.node(idx).content_pending();
             // update node
             let ext_id = self.arena.intern_ext(entry.extension);
             let parent = self.parent_index_for(&entry.path);
@@ -662,12 +659,23 @@ impl MetadataStore {
 
             self.path_index.remove(&self.arena, path);
 
+            if was_dir {
+                for node in self.arena.nodes.iter_mut() {
+                    if node.parent == idx {
+                        node.parent = crate::indexer::arena::NO_PARENT;
+                    }
+                }
+            }
+
             let last_idx = self.arena.len().saturating_sub(1) as u32;
             if idx < last_idx {
                 let last_path = self.arena.path(last_idx);
                 self.path_index.remove(&self.arena, &last_path);
 
-                let last_node = self.arena.nodes[last_idx as usize];
+                let mut last_node = self.arena.nodes[last_idx as usize];
+                if last_node.parent == idx {
+                    last_node.parent = crate::indexer::arena::NO_PARENT;
+                }
                 self.arena.nodes[idx as usize] = last_node;
 
                 let swapped_path = self.arena.path(idx);
@@ -756,10 +764,8 @@ impl MetadataStore {
         // before any node changes.
         let (mut moved, conflicts) = self.scan_rename(old, new);
         if !conflicts.is_empty() {
-            for path in conflicts {
-                self.remove(&path);
-            }
-            // `remove` swap-removes nodes, so indices captured above are
+            self.remove_many(&conflicts);
+            // `remove_many` compacts indices, so indices captured above are
             // stale; rescan (rare: only when the target already existed).
             moved = self.scan_rename(old, new).0;
         }
@@ -792,10 +798,19 @@ impl MetadataStore {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| new_name.clone());
             let (name_off, name_len) = self.arena.names.push(&new_name);
+            let new_ext = if self.arena.node(*idx).is_dir() {
+                None
+            } else {
+                new.extension()
+                    .and_then(|e| e.to_str())
+                    .map(|s| s.to_lowercase())
+            };
+            let new_ext_id = self.arena.intern_ext(new_ext.as_deref());
             let node = self.arena.node_mut(*idx);
             node.parent = new_parent;
             node.name_off = name_off;
             node.name_len = name_len;
+            node.ext_id = new_ext_id;
             node.char_bloom = crate::search::fuzzy::compute_char_mask(&bloom_name);
         }
 

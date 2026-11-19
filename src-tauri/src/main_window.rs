@@ -15,6 +15,8 @@ pub const LABEL: &str = "main";
 
 static LAST_QUERY: Mutex<String> = Mutex::new(String::new());
 static RECENT_QUERIES: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
+static CREATED_TRANSPARENT: AtomicBool = AtomicBool::new(false);
+static LAST_APP_BOUNDS: Mutex<Option<((u32, u32), (i32, i32))>> = Mutex::new(None);
 
 /// Set once the on-disk copy has been read (or found absent), so a missing
 /// file is not looked for again on every window open.
@@ -154,6 +156,7 @@ fn create(app: &AppHandle) -> tauri::Result<WebviewWindow> {
     let config = crate::config::BabbageConfig::load();
     let in_setup = !config.is_setup_complete;
     let launcher = !in_setup && config.app_mode != "app";
+    CREATED_TRANSPARENT.store(launcher, Ordering::Relaxed);
     let window = WebviewWindowBuilder::new(app, LABEL, WebviewUrl::App("index.html".into()))
         .title("Babbage")
         .inner_size(920.0, 640.0)
@@ -170,6 +173,14 @@ fn create(app: &AppHandle) -> tauri::Result<WebviewWindow> {
         .resizable(true)
         .visible(false)
         .build()?;
+
+    if !launcher
+        && let Ok(guard) = LAST_APP_BOUNDS.lock()
+        && let Some(((w, h), (x, y))) = *guard
+    {
+        let _ = window.set_size(tauri::PhysicalSize::new(w, h));
+        let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
+    }
 
     // Closing the window hides it and keeps the app running in the tray.
     //
@@ -214,6 +225,14 @@ pub fn apply_mode(window: &WebviewWindow, app_mode: &str) {
     // user's chosen mode would be ignored until the next launch.
     let setup_complete = crate::config::BabbageConfig::load().is_setup_complete;
     let launcher = app_mode != "app" && setup_complete;
+    if launcher != CREATED_TRANSPARENT.load(Ordering::Relaxed) {
+        // `transparent(...)` can only be configured at window creation time;
+        // recreate so switching modes leaves no opaque-corner artifacts.
+        let app_handle = window.app_handle().clone();
+        hide(&app_handle);
+        show(&app_handle);
+        return;
+    }
     let _ = window.set_decorations(!launcher);
     let _ = window.set_skip_taskbar(launcher);
     let _ = window.set_always_on_top(false);
@@ -265,6 +284,15 @@ pub fn show(app: &AppHandle) {
 pub fn hide(app: &AppHandle) {
     persist_last_query();
     if let Some(window) = existing(app) {
+        if crate::config::BabbageConfig::load().app_mode == "app"
+            && !window.is_minimized().unwrap_or(false)
+            && let (Ok(size), Ok(pos)) = (window.inner_size(), window.outer_position())
+            && size.width >= 320
+            && size.height >= 240
+            && let Ok(mut guard) = LAST_APP_BOUNDS.lock()
+        {
+            *guard = Some(((size.width, size.height), (pos.x, pos.y)));
+        }
         // Hide first, then destroy: on Windows, tearing down a visible
         // transparent + always-on-top window while WebView2 crashes out (the
         // process list is killed below) can briefly leave a composited ghost
@@ -285,8 +313,12 @@ pub fn hide(app: &AppHandle) {
 /// `--toggle`, or a shortcut registered before a mode change should bring the
 /// window forward, not make a normal app vanish from the taskbar.
 pub fn toggle(app: &AppHandle) {
-    let visible = existing(app).is_some_and(|w| w.is_visible().unwrap_or(false));
-    if visible && crate::config::BabbageConfig::load().app_mode != "app" {
+    let should_hide = existing(app).is_some_and(|w| {
+        w.is_visible().unwrap_or(false)
+            && !w.is_minimized().unwrap_or(false)
+            && w.is_focused().unwrap_or(false)
+    });
+    if should_hide && crate::config::BabbageConfig::load().app_mode != "app" {
         hide(app);
     } else {
         show(app);

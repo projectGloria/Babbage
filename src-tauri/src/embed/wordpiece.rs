@@ -18,20 +18,59 @@ pub struct WordPieceTokenizer {
 
 impl WordPieceTokenizer {
     pub fn parse(value: &Value, vocab_size_opt: Option<usize>) -> Option<Self> {
+        Self::parse_inner(value, vocab_size_opt, None)
+    }
+
+    /// Parses a HuggingFace `tokenizer.json` while discarding any token IDs `>= vocab_size`
+    /// and rejecting tables whose unknown token falls outside the embedding matrix.
+    pub fn parse_bounded(value: &Value, vocab_size: usize) -> Option<Self> {
+        Self::parse_inner(value, None, Some(vocab_size))
+    }
+
+    fn parse_inner(
+        value: &Value,
+        exact_vocab_len: Option<usize>,
+        max_vocab_size: Option<usize>,
+    ) -> Option<Self> {
         let model = value.get("model")?;
         let vocab_object = model.get("vocab")?.as_object()?;
-        if let Some(expected_size) = vocab_size_opt
+        if let Some(expected_size) = exact_vocab_len
             && vocab_object.len() != expected_size
         {
             return None;
         }
         let mut vocab = HashMap::with_capacity(vocab_object.len());
         for (k, v) in vocab_object {
-            let id = v.as_u64()? as u32;
-            vocab.insert(k.clone(), id);
+            let Some(id) = v.as_u64() else {
+                if max_vocab_size.is_some() {
+                    continue;
+                }
+                return None;
+            };
+            if let Some(limit) = max_vocab_size
+                && (id as usize) >= limit
+            {
+                continue;
+            }
+            vocab.insert(k.clone(), id as u32);
+        }
+        if max_vocab_size.is_some() && vocab.is_empty() {
+            return None;
         }
 
-        let unknown_id = vocab.get("[UNK]").copied().unwrap_or(100);
+        let unk_token = model
+            .get("unk_token")
+            .and_then(|v| v.as_str())
+            .unwrap_or("[UNK]");
+        let unknown_id = vocab
+            .get(unk_token)
+            .copied()
+            .unwrap_or(if max_vocab_size.is_some() { 0 } else { 100 });
+        if let Some(limit) = max_vocab_size
+            && (unknown_id as usize) >= limit
+        {
+            return None;
+        }
         let cls_id = vocab.get("[CLS]").copied().unwrap_or(101);
         let sep_id = vocab.get("[SEP]").copied().unwrap_or(102);
 
@@ -46,10 +85,15 @@ impl WordPieceTokenizer {
             .and_then(|v| v.as_u64())
             .unwrap_or(100) as usize;
 
-        let lowercase = value
-            .get("normalizer")
+        let normalizer = value.get("normalizer");
+        let lowercase = normalizer
             .and_then(|n| n.get("lowercase"))
             .and_then(|v| v.as_bool())
+            .or_else(|| {
+                normalizer
+                    .and_then(|n| n.get("do_lower_case"))
+                    .and_then(|v| v.as_bool())
+            })
             .unwrap_or(true);
 
         Some(Self {

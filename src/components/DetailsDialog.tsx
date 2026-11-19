@@ -1,8 +1,9 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import type { TFunction } from "i18next";
 import { SearchResult } from "../types";
 import { formatBytes, formatRelativeTime } from "../lib/format";
+import { useFocusTrap } from "../lib/useFocusTrap";
 
 /**
  * "How we found it" view. Opened from the right-click menu, never inline.
@@ -17,6 +18,9 @@ export function DetailsDialog({
 }) {
   const { t } = useTranslation("details");
   const { t: tCommon } = useTranslation("common");
+  const dialogRef = useRef<HTMLDivElement>(null);
+  useFocusTrap(dialogRef);
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
@@ -44,7 +48,9 @@ export function DetailsDialog({
       }}
     >
       <div
+        ref={dialogRef}
         role="dialog"
+        aria-modal="true"
         aria-label={t("title")}
         className="elevated overlay-in w-full max-w-[440px] rounded-sheet p-6"
       >
@@ -86,6 +92,8 @@ function matchLabel(
       return t("match.contentFolded");
     case "Semantic":
       return t("match.semantic");
+    case "Visual":
+      return t("match.visual");
     case "Both":
       return t("match.both");
     default:

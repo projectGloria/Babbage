@@ -7,18 +7,19 @@ use rayon::prelude::*;
 pub fn compute_char_mask(text: &str) -> u64 {
     let mut mask = 0u64;
     for ch in text.chars() {
-        let ch_lower = ch.to_ascii_lowercase();
-        let bit = match ch_lower {
-            'a'..='z' => ch_lower as u8 - b'a',
-            '0'..='9' => 26 + (ch_lower as u8 - b'0'),
-            '_' => 36,
-            '-' => 37,
-            '.' => 38,
-            '/' | '\\' => 39,
-            ' ' => 40,
-            _ => 41 + ((ch as u32 % 23) as u8),
-        };
-        mask |= 1u64 << (bit & 63);
+        for ch_lower in ch.to_lowercase() {
+            let bit = match ch_lower {
+                'a'..='z' => ch_lower as u8 - b'a',
+                '0'..='9' => 26 + (ch_lower as u8 - b'0'),
+                '_' => 36,
+                '-' => 37,
+                '.' => 38,
+                '/' | '\\' => 39,
+                ' ' => 40,
+                _ => 41 + ((ch_lower as u32 % 23) as u8),
+            };
+            mask |= 1u64 << (bit & 63);
+        }
     }
     mask
 }

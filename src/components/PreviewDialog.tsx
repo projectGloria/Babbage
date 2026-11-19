@@ -1,9 +1,10 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useTranslation } from "react-i18next";
 import { TypeTile } from "./TypeTile";
 import { displayParent } from "../lib/format";
 import { isThumbImage } from "../lib/thumbnails";
+import { useFocusTrap } from "../lib/useFocusTrap";
 import type { SearchResult } from "../types";
 
 /* Quick look (Space). Shows the file's preview at a readable size: the
@@ -30,6 +31,8 @@ export function PreviewDialog({
   onClose: () => void;
 }) {
   const { t } = useTranslation("details");
+  const dialogRef = useRef<HTMLDivElement>(null);
+  useFocusTrap(dialogRef);
   const [src, setSrc] = useState<string | null>(null);
   const [text, setText] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -87,7 +90,7 @@ export function PreviewDialog({
         if (e.target === e.currentTarget) onClose();
       }}
     >
-      <div role="dialog" aria-label={t("preview.title")} className="elevated overlay-in flex max-h-full w-full max-w-3xl flex-col overflow-hidden rounded-sheet">
+      <div ref={dialogRef} role="dialog" aria-modal="true" aria-label={t("preview.title")} className="elevated overlay-in flex max-h-full w-full max-w-3xl flex-col overflow-hidden rounded-sheet">
         <div className="flex items-center justify-between gap-4 px-6 pb-4 pt-5">
           <div className="min-w-0">
             <p className="t-lead truncate font-medium text-fg">{result.filename}</p>

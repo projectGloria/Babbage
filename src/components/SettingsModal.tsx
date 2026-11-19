@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
@@ -27,6 +27,7 @@ import { useTheme } from "../hooks/useTheme";
 import { useLanguage } from "../hooks/useLanguage";
 import type { SupportedLanguage } from "../i18n";
 import { useStats } from "../hooks/useStats";
+import { useFocusTrap } from "../lib/useFocusTrap";
 import { Card, Field, Switch, Stepper, SectionHeader, reasonFrom } from "./settings/kit";
 import { WindowModePicker } from "./WindowModePicker";
 import { OcrField } from "./settings/ocr";
@@ -97,6 +98,8 @@ export function Settings({ onClose, initialSection, onConfigSaved }: SettingsPro
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [discardOpen, setDiscardOpen] = useState(false);
+  const panelRef = useRef<HTMLDivElement>(null);
+  useFocusTrap(panelRef, !discardOpen);
   const dirty = config !== null && snapshot !== null && JSON.stringify(config) !== snapshot;
 
   useEffect(() => {
@@ -131,11 +134,7 @@ export function Settings({ onClose, initialSection, onConfigSaved }: SettingsPro
       await invoke("save_config", { config });
       setSnapshot(JSON.stringify(config));
       if (reindex) {
-        await invoke("complete_setup", {
-          watchedDirs: config.watched_dirs,
-          excludedDirs: config.excluded_dirs,
-          shortcut: config.shortcut,
-        });
+        await invoke("reindex");
       }
       onConfigSaved();
       if (reindex) {
@@ -153,7 +152,13 @@ export function Settings({ onClose, initialSection, onConfigSaved }: SettingsPro
   };
 
   return (
-    <div className="fade-in absolute inset-0 z-40 flex bg-bg">
+    <div
+      ref={panelRef}
+      role="dialog"
+      aria-modal="true"
+      aria-label={t("title")}
+      className="fade-in absolute inset-0 z-40 flex bg-bg"
+    >
       <nav data-tauri-drag-region className="relative z-10 flex w-[200px] shrink-0 flex-col overflow-y-auto px-3 pb-3 pt-5">
         <p data-tauri-drag-region className="t-title px-3 pb-4 text-fg">{t("title")}</p>
         <div className="flex flex-col gap-0.5">
@@ -182,6 +187,7 @@ export function Settings({ onClose, initialSection, onConfigSaved }: SettingsPro
         <button
           type="button"
           title={t("close")}
+          aria-label={t("close")}
           onClick={onClose}
           className="btn btn-ghost btn-icon absolute right-4 top-4 z-20 h-8 !rounded-full"
         >
@@ -409,7 +415,7 @@ function GeneralSection({
                  step so a later Save does not write the old language back. */
               setConfig((c) => (c ? { ...c, language: value } : c));
             }}
-            className="h-8 rounded-control border border-line bg-surface px-2 text-[13px] text-fg"
+            className="h-8 rounded-control border border-line bg-elevated px-2 text-[13px] text-fg"
           >
             <option value="">{t("appearance.auto")}</option>
             {Object.entries(supportedLanguages).map(([code, name]) => (
@@ -555,7 +561,7 @@ function FoldersSection({
           >
             <div className="min-w-0">
               <p className="truncate text-[12px] text-fg">
-                {dir.split("/").filter(Boolean).pop() || dir}
+                {dir.split(/[\\/]/).filter(Boolean).pop() || dir}
               </p>
               <p className="truncate font-mono text-[11px] text-subtle">{dir}</p>
             </div>
@@ -1578,11 +1584,11 @@ function AboutSection({
             <p className="text-[15px] font-semibold text-fg">Babbage</p>
             <p className="font-mono text-[11px] text-subtle">{version}</p>
             <p className="mt-1 text-[11px] text-subtle">
-              Completely local search engine. Offline & private.
+              {t("about.tagline")}
             </p>
           </div>
           <div className="flex items-center gap-1.5">
-            {["Rust", "Tauri 2", "Local", "Offline"].map((b) => (
+            {["Rust", "Tauri 2", t("about.badgeLocal"), t("about.badgeOffline")].map((b) => (
               <span
                 key={b}
                 className="rounded-full border border-line px-2.5 py-1 font-mono text-[11px] text-muted"
@@ -1698,6 +1704,7 @@ function DiscardDialog({
 }) {
   const { t } = useTranslation("settings");
   const dialogRef = React.useRef<HTMLDivElement>(null);
+  useFocusTrap(dialogRef);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -1708,7 +1715,6 @@ function DiscardDialog({
       }
     };
     window.addEventListener("keydown", onKey, true);
-    dialogRef.current?.querySelector<HTMLButtonElement>("button")?.focus();
     return () => window.removeEventListener("keydown", onKey, true);
   }, [onKeep]);
 

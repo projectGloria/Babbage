@@ -98,7 +98,16 @@ pub fn tokenize(input: &str) -> Vec<Token> {
                     i += 1; // skip closing quote
                 }
                 if key.eq_ignore_ascii_case("re") {
-                    tokens.push(Token::Regex(val));
+                    if negated {
+                        tokens.push(Token::KeyValue {
+                            negated: true,
+                            key,
+                            value: val,
+                            quoted_value: true,
+                        });
+                    } else {
+                        tokens.push(Token::Regex(val));
+                    }
                 } else {
                     tokens.push(Token::KeyValue {
                         negated,
@@ -111,10 +120,19 @@ pub fn tokenize(input: &str) -> Vec<Token> {
                 let val = chars[(colon_pos.unwrap() + 1)..i]
                     .iter()
                     .collect::<String>();
-                let trimmed_val = val.trim_matches(|c| c == '(' || c == ')').to_string();
                 if key.eq_ignore_ascii_case("re") {
-                    tokens.push(Token::Regex(trimmed_val));
+                    if negated {
+                        tokens.push(Token::KeyValue {
+                            negated: true,
+                            key,
+                            value: val,
+                            quoted_value: false,
+                        });
+                    } else {
+                        tokens.push(Token::Regex(val));
+                    }
                 } else {
+                    let trimmed_val = val.trim_matches(|c| c == '(' || c == ')').to_string();
                     tokens.push(Token::KeyValue {
                         negated,
                         key,

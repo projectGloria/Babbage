@@ -5,6 +5,27 @@ use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 
+/// Default-deny sensitive folder and credential filenames skipped during walks,
+/// live watching, and agent reads.
+pub const SENSITIVE_NAMES: &[&str] = &[
+    ".ssh",
+    ".gnupg",
+    ".gpg",
+    ".aws",
+    ".azure",
+    ".kube",
+    ".docker",
+    ".password-store",
+    "1password",
+    "bitwarden",
+    "keepass",
+    "keepassxc",
+    ".env",
+    ".env.local",
+    ".env.production",
+    ".env.development",
+];
+
 #[derive(Debug, Clone)]
 pub struct FileEntry {
     pub id: u64,
@@ -260,27 +281,6 @@ pub fn walk_directories(
     let ignore_dirs: std::sync::Arc<std::sync::Mutex<Vec<PathBuf>>> = Default::default();
     let excluded_set: HashSet<String> = excluded_dirs.iter().map(|s| s.to_lowercase()).collect();
 
-    // Default-deny sensitive paths. These are skipped even if the user has not
-    // added them to exclusions. Hidden entries (names starting with '.') are
-    // already skipped above, which covers ~/.ssh, ~/.gnupg, ~/.aws, etc.
-    const SENSITIVE_NAMES: &[&str] = &[
-        ".ssh",
-        ".gnupg",
-        ".gpg",
-        ".aws",
-        ".azure",
-        ".kube",
-        ".docker",
-        ".password-store",
-        "1password",
-        "bitwarden",
-        "keepass",
-        "keepassxc",
-        ".env",
-        ".env.local",
-        ".env.production",
-        ".env.development",
-    ];
     let sensitive_set: HashSet<String> = SENSITIVE_NAMES.iter().map(|s| s.to_string()).collect();
 
     for root in dirs {

@@ -285,12 +285,16 @@ pub fn parse_query(
                         }
                     }
                     "path" => {
-                        push_term!(Term {
-                            text: value.clone(),
-                            field: TermField::Path,
-                            phrase: quoted_value,
-                            is_regex: false,
-                        });
+                        if negated {
+                            filters.push(Filter::Not(Box::new(Filter::Path(value.clone()))));
+                        } else {
+                            push_term!(Term {
+                                text: value.clone(),
+                                field: TermField::Path,
+                                phrase: quoted_value,
+                                is_regex: false,
+                            });
+                        }
                         active_filters_dto.push(ActiveFilterDto {
                             raw: raw_token,
                             filter_type: "path".to_string(),
@@ -356,7 +360,7 @@ pub fn parse_query(
                         let filter = match value.to_lowercase().as_str() {
                             "dir" | "directory" | "folder" => Some(Filter::Kind(FileKind::Dir)),
                             "file" => Some(Filter::Kind(FileKind::File)),
-                            "image" | "video" | "audio" | "doc" | "code" | "archive" => {
+                            "image" | "video" | "audio" | "media" | "doc" | "code" | "archive" => {
                                 Some(Filter::Type(value.to_lowercase()))
                             }
                             _ => None,
@@ -402,20 +406,56 @@ pub fn parse_query(
                         });
                     }
                     "name" => {
-                        push_term!(Term {
-                            text: value.clone(),
-                            field: TermField::Name,
-                            phrase: quoted_value,
-                            is_regex: false,
-                        });
+                        if negated {
+                            filters.push(Filter::Not(Box::new(Filter::Name(value.clone()))));
+                            active_filters_dto.push(ActiveFilterDto {
+                                raw: raw_token,
+                                filter_type: "name".to_string(),
+                                value,
+                                negated,
+                            });
+                        } else {
+                            push_term!(Term {
+                                text: value.clone(),
+                                field: TermField::Name,
+                                phrase: quoted_value,
+                                is_regex: false,
+                            });
+                        }
                     }
                     "content" => {
-                        push_term!(Term {
-                            text: value.clone(),
-                            field: TermField::Content,
-                            phrase: quoted_value,
-                            is_regex: false,
-                        });
+                        if negated {
+                            active_filters_dto.push(ActiveFilterDto {
+                                raw: raw_token,
+                                filter_type: "content".to_string(),
+                                value,
+                                negated,
+                            });
+                        } else {
+                            push_term!(Term {
+                                text: value.clone(),
+                                field: TermField::Content,
+                                phrase: quoted_value,
+                                is_regex: false,
+                            });
+                        }
+                    }
+                    "re" => {
+                        if negated {
+                            active_filters_dto.push(ActiveFilterDto {
+                                raw: raw_token,
+                                filter_type: "re".to_string(),
+                                value,
+                                negated,
+                            });
+                        } else {
+                            push_term!(Term {
+                                text: value,
+                                field: TermField::Any,
+                                phrase: false,
+                                is_regex: true,
+                            });
+                        }
                     }
                     "mode" => {
                         if value.eq_ignore_ascii_case("exhaustive") {
@@ -549,7 +589,7 @@ fn parse_size_range(val: &str) -> Option<RangeOp> {
         return Some(RangeOp::Lt(parse_size(rest)?));
     }
     let size = parse_size(s)?;
-    Some(RangeOp::Between(size.saturating_sub(1024), size + 1024))
+    Some(RangeOp::Between(size.saturating_sub(1024), size.saturating_add(1024)))
 }
 
 /// Maximum bound for a `near[x]` distance. Sloppier phrases beyond this are

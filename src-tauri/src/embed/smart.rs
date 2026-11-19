@@ -82,17 +82,32 @@ impl SmartEmbedder {
             Err(_) => 384,
         };
 
-        static ENVIRONMENT: Mutex<Option<ort::environment::Environment>> = Mutex::new(None);
-        let session = {
-            let mut env = ENVIRONMENT.lock();
-            if env.is_none() {
-                *env = Some(ort::init().build().ok()?);
-            }
-            let builder = ort::session::Session::builder(env.as_ref().unwrap()).ok()?;
-            // Bound intra-op threads to 1 to stay within background budget
-            let mut builder = builder.with_intra_threads(1).ok()?;
-            builder.commit_from_file(&model_path).ok()?
-        };
+        if !crate::ocr::runtime_loadable() {
+            return None;
+        }
+
+        let session = std::panic::catch_unwind(|| -> Option<Session> {
+            #[cfg(feature = "accurate-ocr")]
+            let env = paddleocr_rs_onnx::shared_environment().ok()?;
+            #[cfg(not(feature = "accurate-ocr"))]
+            let env = {
+                static ENVIRONMENT: Mutex<Option<ort::environment::Environment>> = Mutex::new(None);
+                let mut guard = ENVIRONMENT.lock();
+                if guard.is_none() {
+                    *guard = Some(ort::init().build().ok()?);
+                }
+                guard.as_ref()?.clone()
+            };
+            let builder = ort::session::Session::builder(&env).ok()?;
+            // Bound intra/inter-op threads to 1 to stay within background budget
+            let builder = builder
+                .with_intra_threads(1)
+                .ok()?
+                .with_inter_threads(1)
+                .ok()?;
+            builder.commit_from_file(&model_path).ok()
+        })
+        .ok()??;
 
         let has_token_types = session
             .inputs()

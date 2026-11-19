@@ -24,13 +24,39 @@ export function ContextMenu({
   const ref = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
+    const prev = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const menuItems = () =>
+      Array.from(ref.current?.querySelectorAll<HTMLButtonElement>('[role="menuitem"]') ?? []);
+    menuItems()[0]?.focus();
+
+    const closeAndRestore = () => {
+      onClose();
+      if (prev && document.contains(prev)) prev.focus();
+    };
     const onDown = (e: MouseEvent) => {
-      if (!ref.current?.contains(e.target as Node)) onClose();
+      if (!ref.current?.contains(e.target as Node)) closeAndRestore();
     };
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         e.preventDefault();
-        onClose();
+        closeAndRestore();
+        return;
+      }
+      const list = menuItems();
+      if (list.length === 0) return;
+      const idx = list.indexOf(document.activeElement as HTMLButtonElement);
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        list[(idx + 1) % list.length].focus();
+      } else if (e.key === "ArrowUp") {
+        e.preventDefault();
+        list[(idx - 1 + list.length) % list.length].focus();
+      } else if (e.key === "Home") {
+        e.preventDefault();
+        list[0].focus();
+      } else if (e.key === "End") {
+        e.preventDefault();
+        list[list.length - 1].focus();
       }
     };
     const close = () => onClose();

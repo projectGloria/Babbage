@@ -521,9 +521,15 @@ fn handle_rest_search(request: &Request, state: &HttpState) -> HttpResponse {
         .and_then(|(_, v)| v.parse::<usize>().ok())
         .map(|limit| limit.clamp(1, 50))
         .unwrap_or(10);
+    let path = params.iter().find(|(k, _)| k == "path").map(|(_, v)| v.as_str());
 
     let payload = with_session(state, |session| {
-        match session.search_page(&query, limit, 0) {
+        let scope_paths = match super::agent_scope_paths(&session.scoped_roots(), path) {
+            Ok(paths) => paths,
+            Err(error) => return json!({"error": error}),
+        };
+        let effective = super::compose_query_scoped(&query, &scope_paths, None, None, false);
+        match session.search_page(&effective, limit, 0) {
             Ok(response) => {
                 let results: Vec<Value> = response
                     .results

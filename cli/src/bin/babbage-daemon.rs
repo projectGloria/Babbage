@@ -359,6 +359,10 @@ fn handle_client(stream: LocalSocketStream, token: &str, manager: &Arc<IndexerMa
                 manager.start_indexing();
                 Ok(json!({"started": true}))
             }
+            "reembed_all" => {
+                manager.on_semantic_model_changed();
+                Ok(json!({"started": true}))
+            }
             "search" => {
                 let query = params.get("query").and_then(|v| v.as_str()).unwrap_or("");
                 let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
@@ -383,16 +387,21 @@ fn handle_client(stream: LocalSocketStream, token: &str, manager: &Arc<IndexerMa
                 }
             }
             "get_snippets" => {
-                let paths: Vec<String> = params
-                    .get("paths")
-                    .and_then(|v| v.as_array())
-                    .map(|items| {
-                        items
-                            .iter()
-                            .filter_map(|item| item.as_str().map(str::to_string))
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                let paths: Vec<String> = {
+                    let metadata = manager.metadata.read();
+                    params
+                        .get("paths")
+                        .and_then(|v| v.as_array())
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(|item| item.as_str())
+                                .filter(|p| metadata.get(Path::new(p)).is_some())
+                                .map(str::to_string)
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                };
                 let query = params.get("query").and_then(|v| v.as_str()).unwrap_or("");
                 serde_json::to_value(babbage_lib::commands::compute_snippets(paths, query))
                     .map_err(|e| e.to_string())
@@ -402,27 +411,41 @@ fn handle_client(stream: LocalSocketStream, token: &str, manager: &Arc<IndexerMa
                 if path.is_empty() {
                     Err("read_snippet requires a path".to_string())
                 } else {
-                    let query = params.get("query").and_then(|v| v.as_str());
-                    let max_tokens = params
-                        .get("max_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(256)
-                        .clamp(32, 1024) as usize;
-                    match babbage_lib::agent::mcp::extract_text(Path::new(path)) {
-                        Some(text) => {
-                            let (line_start, line_end, window, truncated) =
-                                babbage_lib::agent::mcp::read_snippet_window(
-                                    &text, query, max_tokens,
-                                );
-                            Ok(json!({
-                                "path": path,
-                                "line_start": line_start,
-                                "line_end": line_end,
-                                "text": window,
-                                "truncated": truncated,
-                            }))
+                    let allowed = {
+                        let cfg = manager.config.read();
+                        babbage_lib::agent::agent_read_allowed(
+                            &cfg.agent_scoped_roots,
+                            &cfg.excluded_extensions,
+                            path,
+                        )
+                    };
+                    if !allowed {
+                        Err("read_snippet: path is not permitted by agent policy".to_string())
+                    } else if manager.metadata.read().get(Path::new(path)).is_none() {
+                        Err(format!("read_snippet: path is not in the index: {}", path))
+                    } else {
+                        let query = params.get("query").and_then(|v| v.as_str());
+                        let max_tokens = params
+                            .get("max_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(256)
+                            .clamp(32, 1024) as usize;
+                        match babbage_lib::agent::mcp::extract_text(Path::new(path)) {
+                            Some(text) => {
+                                let (line_start, line_end, window, truncated) =
+                                    babbage_lib::agent::mcp::read_snippet_window(
+                                        &text, query, max_tokens,
+                                    );
+                                Ok(json!({
+                                    "path": path,
+                                    "line_start": line_start,
+                                    "line_end": line_end,
+                                    "text": window,
+                                    "truncated": truncated,
+                                }))
+                            }
+                            None => Err(format!("Could not read text from {}", path)),
                         }
-                        None => Err(format!("Could not read text from {}", path)),
                     }
                 }
             }

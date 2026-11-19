@@ -12,11 +12,13 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 const RENDER_TIMEOUT: Duration = Duration::from_secs(12);
 const MAX_CONCURRENT_RENDERS: usize = 2;
+static RENDER_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Counting semaphore for external renders.
 struct Slots {
@@ -63,7 +65,7 @@ pub enum Kind {
 pub fn kind_for(filename: &str) -> Option<Kind> {
     let ext = filename.rsplit('.').next().filter(|_| filename.contains('.'))?;
     match ext.to_ascii_lowercase().as_str() {
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tiff" | "tif" => Some(Kind::Image),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tiff" | "tif" | "ico" => Some(Kind::Image),
         "pdf" => Some(Kind::Pdf),
         _ => None,
     }
@@ -88,7 +90,7 @@ pub fn preview_jpeg(source: &Path, out_dir: &Path) -> Result<PathBuf, String> {
 }
 
 fn target_for(source: &Path, out_dir: &Path) -> PathBuf {
-    let hash = fnv1a(source.to_string_lossy().as_bytes());
+    let hash = crate::util::fnv1a_64(source.to_string_lossy().as_bytes());
     out_dir.join(format!("{:016x}-preview.jpg", hash))
 }
 
@@ -100,6 +102,14 @@ fn is_fresh(target: &Path, source: &Path) -> bool {
             _ => false,
         },
         _ => false,
+    }
+}
+
+struct TempWorkDir(PathBuf);
+
+impl Drop for TempWorkDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -115,17 +125,23 @@ fn render_external(source: &Path, out_dir: &Path, kind: Kind) -> Result<PathBuf,
         Kind::Image => return Err("images use the thumbnail path".into()),
     };
 
-    // Render to a temp file, then move it into place so readers never see a
-    // half-written JPEG.
-    let work = out_dir.join(format!(
-        ".render-{}-{}",
-        std::process::id(),
-        fnv1a(source.to_string_lossy().as_bytes())
-    ));
-    std::fs::create_dir_all(&work).map_err(|e| format!("render dir: {}", e))?;
-    let raw_base = work.join("frame");
-
     let _slot = acquire();
+    if is_fresh(&target, source) {
+        return Ok(target);
+    }
+
+    // Render to a unique temp directory, then atomically rename into place so
+    // readers never observe a partially written JPEG or race on a shared work dir.
+    let work_dir = out_dir.join(format!(
+        ".render-{}-{}-{:016x}",
+        std::process::id(),
+        RENDER_SEQ.fetch_add(1, Ordering::Relaxed),
+        crate::util::fnv1a_64(source.to_string_lossy().as_bytes())
+    ));
+    std::fs::create_dir_all(&work_dir).map_err(|e| format!("render dir: {}", e))?;
+    let _cleanup = TempWorkDir(work_dir.clone());
+    let raw_base = work_dir.join("frame");
+
     let ok = match kind {
         Kind::Pdf => {
             let mut cmd = Command::new(tool);
@@ -153,21 +169,28 @@ fn render_external(source: &Path, out_dir: &Path, kind: Kind) -> Result<PathBuf,
         Kind::Image => false,
     };
     let raw = raw_base.with_extension("jpg");
-    let result = if ok && raw.is_file() {
-        image::open(&raw)
-            .map_err(|e| format!("could not read rendered frame: {}", e))
-            .and_then(|img| {
-                img.thumbnail(crate::indexer::extract::image::THUMB_SIZE, crate::indexer::extract::image::THUMB_SIZE)
-                    .to_rgb8()
-                    .save_with_format(&target, image::ImageFormat::Jpeg)
-                    .map_err(|e| format!("could not write preview: {}", e))
-            })
-            .map(|_| target.clone())
+    if ok && raw.is_file() {
+        let img = image::open(&raw).map_err(|e| format!("could not read rendered frame: {}", e))?;
+        let thumb = crate::indexer::extract::image::to_rgb8_composited(
+            &img.thumbnail(
+                crate::indexer::extract::image::THUMB_SIZE,
+                crate::indexer::extract::image::THUMB_SIZE,
+            ),
+            [255, 255, 255],
+        );
+        let tmp_out = work_dir.join("out.jpg");
+        thumb
+            .save_with_format(&tmp_out, image::ImageFormat::Jpeg)
+            .map_err(|e| format!("could not write preview: {}", e))?;
+        if std::fs::rename(&tmp_out, &target).is_err() {
+            let _ = std::fs::remove_file(&target);
+            std::fs::rename(&tmp_out, &target)
+                .map_err(|e| format!("could not install preview: {}", e))?;
+        }
+        Ok(target)
     } else {
         Err("render failed or timed out".into())
-    };
-    let _ = std::fs::remove_dir_all(&work);
-    result
+    }
 }
 
 /// Runs a command with a hard timeout. Returns true on a zero exit status.
@@ -216,18 +239,14 @@ fn find_tool(name: &str) -> Option<PathBuf> {
     for extra in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"] {
         dirs.push(PathBuf::from(extra));
     }
+    let bin = if cfg!(windows) && !name.ends_with(".exe") {
+        format!("{name}.exe")
+    } else {
+        name.to_string()
+    };
     dirs.into_iter()
-        .map(|d| d.join(name))
+        .flat_map(|d| [d.join(&bin), d.join(name)])
         .find(|p| p.is_file())
-}
-
-fn fnv1a(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
 }
 
 #[cfg(test)]

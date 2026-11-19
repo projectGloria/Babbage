@@ -813,8 +813,12 @@ const ALWAYS_DENIED_EXTENSIONS: &[&str] = &[
 const ALWAYS_DENIED_NAMES: &[&str] = &[
     ".env",
     ".netrc",
+    ".npmrc",
+    ".pypirc",
+    ".git-credentials",
     ".pgpass",
     "credentials",
+    "credentials.json",
     "id_rsa",
     "id_dsa",
     "id_ecdsa",
@@ -823,22 +827,37 @@ const ALWAYS_DENIED_NAMES: &[&str] = &[
     "secring.gpg",
 ];
 
-/// Whether the agent surface may read `path` directly.
-///
-/// Scope answers "where"; this answers "what". An empty scope means the whole
-/// index is searchable, which is the documented default, but it must not also
-/// mean "and any file on disk": without this check `read_snippet` on an
-/// absolute path returned the contents of `~/.ssh/id_ed25519` to any connected
-/// MCP client, because a direct read never consults the indexing denylist.
-pub fn agent_read_allowed(roots: &[String], excluded_extensions: &[String], path: &str) -> bool {
-    if !agent_path_allowed(roots, path) {
-        return false;
+fn path_is_denied(path_str: &str, excluded_extensions: &[String]) -> bool {
+    let p = Path::new(path_str);
+    if p.components().any(|c| {
+        c.as_os_str().to_str().is_some_and(|name| {
+            crate::indexer::walker::SENSITIVE_NAMES
+                .iter()
+                .any(|s| name.eq_ignore_ascii_case(s))
+        })
+    }) {
+        return true;
     }
 
-    let file_name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    let file_name = path_str.rsplit(['/', '\\']).next().unwrap_or(path_str);
     let lower_name = file_name.to_ascii_lowercase();
     if ALWAYS_DENIED_NAMES.contains(&lower_name.as_str()) {
-        return false;
+        return true;
+    }
+    if lower_name.starts_with(".env.")
+        && !matches!(
+            lower_name.as_str(),
+            ".env.example" | ".env.sample" | ".env.template"
+        )
+    {
+        return true;
+    }
+    if lower_name.starts_with("id_rsa")
+        || lower_name.starts_with("id_ed25519")
+        || lower_name.starts_with("id_ecdsa")
+        || lower_name.starts_with("id_dsa")
+    {
+        return true;
     }
 
     let extension = lower_name
@@ -851,7 +870,34 @@ pub fn agent_read_allowed(roots: &[String], excluded_extensions: &[String], path
                 .iter()
                 .any(|excluded| excluded.trim_start_matches('.').eq_ignore_ascii_case(extension)))
     {
+        return true;
+    }
+
+    false
+}
+
+/// Whether the agent surface may read `path` directly.
+///
+/// Scope answers "where"; this answers "what". An empty scope means the whole
+/// index is searchable, which is the documented default, but it must not also
+/// mean "and any file on disk": without this check `read_snippet` on an
+/// absolute path returned the contents of `~/.ssh/id_ed25519` to any connected
+/// MCP client, because a direct read never consults the indexing denylist.
+pub fn agent_read_allowed(roots: &[String], excluded_extensions: &[String], path: &str) -> bool {
+    if !agent_path_allowed(roots, path) {
         return false;
+    }
+    if path_is_denied(path, excluded_extensions) {
+        return false;
+    }
+    // Always resolve symlinks when the path exists on disk so a symlink inside
+    // an allowed directory cannot point to `~/.ssh/id_ed25519` or `.env`.
+    if let Ok(canonical) = std::fs::canonicalize(expand_tilde(path)) {
+        let canonical = strip_verbatim(canonical);
+        let canonical_str = canonical.to_string_lossy();
+        if path_is_denied(&canonical_str, excluded_extensions) {
+            return false;
+        }
     }
 
     true
@@ -962,23 +1008,7 @@ pub fn now_unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
-fn dir_size_bytes(dir: &Path) -> u64 {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return 0;
-    };
-    let mut total = 0u64;
-    for entry in entries.flatten() {
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if file_type.is_dir() {
-            total = total.saturating_add(dir_size_bytes(&entry.path()));
-        } else if file_type.is_file() {
-            total = total.saturating_add(entry.metadata().map(|m| m.len()).unwrap_or(0));
-        }
-    }
-    total
-}
+use crate::util::dir_size_bytes;
 
 /// Sums files in `dir` whose name starts with `prefix` (e.g. `metadata.db`,
 /// `metadata.db-wal`, `metadata.db-shm`).

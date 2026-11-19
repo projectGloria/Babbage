@@ -73,24 +73,7 @@ fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Recursively sums regular files below `dir`. Symlinks are not followed.
-fn dir_size_bytes(dir: &Path) -> u64 {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return 0;
-    };
-    let mut total = 0u64;
-    for entry in entries.flatten() {
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if file_type.is_dir() {
-            total = total.saturating_add(dir_size_bytes(&entry.path()));
-        } else if file_type.is_file() {
-            total = total.saturating_add(entry.metadata().map(|m| m.len()).unwrap_or(0));
-        }
-    }
-    total
-}
+use crate::util::dir_size_bytes;
 
 /// Sums sizes of entries in the babbage config directory whose name starts with
 /// `prefix` (e.g. `metadata.db` matches `metadata.db`, `metadata.db-wal`, ...).
@@ -528,10 +511,16 @@ pub fn stats_for(indexer: &crate::indexer::IndexerManager) -> Result<serde_json:
 
 #[tauri::command]
 pub async fn get_stats(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    if let Some(daemon) = state.daemon.as_ref() {
-        return daemon.get_stats();
-    }
-    stats_for(&state.indexer)
+    let daemon = state.daemon;
+    let indexer = std::sync::Arc::clone(&state.indexer);
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Some(daemon) = daemon {
+            return daemon.get_stats();
+        }
+        stats_for(&indexer)
+    })
+    .await
+    .map_err(|e| format!("Stats task failed: {}", e))?
 }
 
 #[tauri::command]
@@ -556,7 +545,11 @@ pub async fn set_theme(
 
     let mut config = state.indexer.config.read().clone();
     config.theme = normalized.clone();
-    config.save()?;
+    if let Some(daemon) = state.daemon.as_ref() {
+        daemon.save_config(config.clone())?;
+    } else {
+        config.save()?;
+    }
     *state.indexer.config.write() = config;
 
     // The tray watcher in `lib.rs` picks up the new theme on its next tick.
@@ -568,8 +561,13 @@ pub async fn set_theme(
 
 #[tauri::command]
 pub async fn open_file(path: String, state: State<'_, AppState>) -> Result<(), String> {
-    state.indexer.metadata.read().record_open(Path::new(&path));
-    open::that(&path).map_err(|e| format!("Failed to open file: {}", e))
+    let indexer = std::sync::Arc::clone(&state.indexer);
+    tauri::async_runtime::spawn_blocking(move || {
+        indexer.metadata.read().record_open(Path::new(&path));
+        open::that(&path).map_err(|e| format!("Failed to open file: {}", e))
+    })
+    .await
+    .map_err(|e| format!("Open file task failed: {}", e))?
 }
 
 #[tauri::command]
@@ -947,10 +945,16 @@ pub async fn find_duplicates(
     max_distance: Option<u32>,
     limit: Option<usize>,
 ) -> Result<Vec<DuplicateGroup>, String> {
-    if let Some(daemon) = state.daemon.as_ref() {
-        return daemon.find_duplicates(max_distance, limit);
-    }
-    duplicates_for(&state.indexer, max_distance, limit)
+    let daemon = state.daemon;
+    let indexer = std::sync::Arc::clone(&state.indexer);
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Some(daemon) = daemon {
+            return daemon.find_duplicates(max_distance, limit);
+        }
+        duplicates_for(&indexer, max_distance, limit)
+    })
+    .await
+    .map_err(|e| format!("Duplicates task failed: {}", e))?
 }
 
 #[tauri::command]
@@ -959,12 +963,16 @@ pub async fn find_similar_images(
     path: String,
     limit: Option<usize>,
 ) -> Result<Vec<crate::embed::visual::SimilarImageResult>, String> {
-    if let Some(daemon) = state.daemon.as_ref() {
-        return daemon.find_similar_images(&path, limit);
-    }
-    state
-        .indexer
-        .find_similar_images(Path::new(&path), limit.unwrap_or(20))
+    let daemon = state.daemon;
+    let indexer = std::sync::Arc::clone(&state.indexer);
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Some(daemon) = daemon {
+            return daemon.find_similar_images(&path, limit);
+        }
+        indexer.find_similar_images(Path::new(&path), limit.unwrap_or(20))
+    })
+    .await
+    .map_err(|e| format!("Visual search task failed: {}", e))?
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1051,9 +1059,13 @@ pub async fn execute_command(
 
 #[tauri::command]
 pub async fn read_file_content(path: String) -> Result<String, String> {
-    let p = Path::new(&path);
-    crate::indexer::content::read_text_content(p, 256_000)
-        .ok_or_else(|| "Could not read text content from file".to_string())
+    tauri::async_runtime::spawn_blocking(move || {
+        let p = Path::new(&path);
+        crate::indexer::content::read_text_content(p, 256_000)
+            .ok_or_else(|| "Could not read text content from file".to_string())
+    })
+    .await
+    .map_err(|e| format!("Read file task failed: {}", e))?
 }
 
 #[tauri::command]
@@ -1112,11 +1124,16 @@ pub async fn is_setup_configured() -> Result<bool, String> {
 }
 
 #[tauri::command]
-pub async fn run_setup_again() -> Result<(), String> {
-    let mut config = BabbageConfig::load();
+pub async fn run_setup_again(state: State<'_, AppState>) -> Result<(), String> {
+    let mut config = state.indexer.config.read().clone();
     config.is_setup_complete = false;
     config.first_scan_done = false;
-    config.save()?;
+    if let Some(daemon) = state.daemon.as_ref() {
+        daemon.save_config(config.clone())?;
+    } else {
+        config.save()?;
+    }
+    *state.indexer.config.write() = config;
     Ok(())
 }
 
@@ -1231,13 +1248,17 @@ pub fn home_data_for(indexer: &crate::indexer::IndexerManager) -> Result<HomeDat
     // share timestamps, and without it the tail of the list would reshuffle
     // on every refetch.
     let touched = |item: &HomeItem| item.last_open.max(item.modified);
-    recent.sort_by(|a, b| {
+    let cmp_recent = |a: &HomeItem, b: &HomeItem| {
         touched(b)
             .cmp(&touched(a))
             .then_with(|| b.opens.cmp(&a.opens))
             .then_with(|| a.path.cmp(&b.path))
-    });
-    recent.truncate(12);
+    };
+    if recent.len() > 12 {
+        recent.select_nth_unstable_by(12, cmp_recent);
+        recent.truncate(12);
+    }
+    recent.sort_by(cmp_recent);
 
     let pins = config
         .pins
@@ -1283,10 +1304,18 @@ pub fn home_data_for(indexer: &crate::indexer::IndexerManager) -> Result<HomeDat
 
 #[tauri::command]
 pub async fn get_home_data(state: State<'_, AppState>) -> Result<HomeData, String> {
-    if let Some(daemon) = state.daemon.as_ref() {
-        return daemon.get_home_data();
-    }
-    home_data_for(&state.indexer)
+    let daemon = state.daemon;
+    let indexer = std::sync::Arc::clone(&state.indexer);
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Some(daemon) = daemon {
+            let mut data = daemon.get_home_data()?;
+            data.recent_queries = crate::main_window::recent_queries();
+            return Ok(data);
+        }
+        home_data_for(&indexer)
+    })
+    .await
+    .map_err(|e| format!("Home data task failed: {}", e))?
 }
 
 pub fn toggle_pin_for(
@@ -1360,10 +1389,16 @@ pub async fn get_scope_suggestions(
     limit: Option<usize>,
     state: State<'_, AppState>,
 ) -> Result<Vec<String>, String> {
-    if let Some(daemon) = state.daemon.as_ref() {
-        return daemon.get_scope_suggestions(prefix, limit);
-    }
-    scope_suggestions_for(&state.indexer, prefix, limit)
+    let daemon = state.daemon;
+    let indexer = std::sync::Arc::clone(&state.indexer);
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Some(daemon) = daemon {
+            return daemon.get_scope_suggestions(prefix, limit);
+        }
+        scope_suggestions_for(&indexer, prefix, limit)
+    })
+    .await
+    .map_err(|e| format!("Scope suggestions task failed: {}", e))?
 }
 
 #[tauri::command]
@@ -1588,6 +1623,21 @@ pub async fn rebuild_index(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
+pub async fn reindex(state: State<'_, AppState>) -> Result<(), String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Some(daemon) = state.daemon.as_ref() {
+            daemon.rescan()
+        } else {
+            state.indexer.start_indexing();
+            Ok(())
+        }
+    })
+    .await
+    .map_err(|e| format!("reindex task panicked: {}", e))?
+}
+
+#[tauri::command]
 pub async fn get_reset_pending() -> Result<bool, String> {
     Ok(crate::reset_pending())
 }
@@ -1684,7 +1734,23 @@ pub fn self_heal_autostart() {
 
 #[tauri::command]
 pub async fn run_doctor(state: State<'_, AppState>) -> Result<crate::doctor::DoctorReport, String> {
-    Ok(crate::doctor::run(&state))
+    let cloned = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || crate::doctor::run(&cloned))
+        .await
+        .map_err(|e| format!("Doctor task failed: {}", e))
+}
+
+#[tauri::command]
+pub async fn reembed_all(state: State<'_, AppState>) -> Result<(), String> {
+    if let Some(daemon) = state.daemon.as_ref() {
+        return daemon.reembed_all();
+    }
+    let indexer = std::sync::Arc::clone(&state.indexer);
+    tauri::async_runtime::spawn_blocking(move || {
+        indexer.on_semantic_model_changed();
+    })
+    .await
+    .map_err(|e| format!("Re-embed task failed: {}", e))
 }
 
 #[cfg(test)]

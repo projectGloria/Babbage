@@ -47,6 +47,9 @@ pub fn extract_docx(path: &Path, max_bytes: usize) -> Option<String> {
                 let name = e.name();
                 if name.as_ref() == "w:t" {
                     in_text = false;
+                    if !text_out.is_empty() && !text_out.ends_with([' ', '\n']) {
+                        text_out.push(' ');
+                    }
                 } else if name.as_ref() == "w:p" && !text_out.ends_with('\n') {
                     text_out.push('\n');
                 }
@@ -56,13 +59,11 @@ pub fn extract_docx(path: &Path, max_bytes: usize) -> Option<String> {
                     // XML entities in raw text (&amp; &#233;) must be decoded
                     // or "R&D report" can never match a search for "R&D".
                     text_out.push_str(e.as_ref());
-                    text_out.push(' ');
                 }
             }
             Ok(Event::GeneralRef(ref r)) => {
                 if in_text {
                     text_out.push_str(&decoded_ref(r));
-                    text_out.push(' ');
                 }
             }
             Ok(Event::Eof) => break,
@@ -130,14 +131,21 @@ pub fn extract_pptx(path: &Path, max_bytes: usize) -> Option<String> {
                     let name = e.name();
                     if name.as_ref() == "a:t" {
                         in_text = false;
-                    } else if name.as_ref() == "a:p" {
+                        if !slide_text.is_empty() && !slide_text.ends_with(' ') {
+                            slide_text.push(' ');
+                        }
+                    } else if name.as_ref() == "a:p" && !slide_text.is_empty() && !slide_text.ends_with(' ') {
                         slide_text.push(' ');
                     }
                 }
                 Ok(Event::Text(ref e)) => {
                     if in_text {
                         slide_text.push_str(e.as_ref());
-                        slide_text.push(' ');
+                    }
+                }
+                Ok(Event::GeneralRef(ref r)) => {
+                    if in_text {
+                        slide_text.push_str(&decoded_ref(r));
                     }
                 }
                 Ok(Event::Eof) => break,
@@ -268,20 +276,21 @@ pub fn extract_xlsx(path: &Path, max_bytes: usize) -> Option<String> {
                     let name = e.name();
                     if name.as_ref() == "v" || name.as_ref() == "t" {
                         in_v = false;
-                    } else if name.as_ref() == "row" {
+                        if !text_out.is_empty() && !text_out.ends_with([' ', '\n']) {
+                            text_out.push(' ');
+                        }
+                    } else if name.as_ref() == "row" && !text_out.ends_with('\n') {
                         text_out.push('\n');
                     }
                 }
                 Ok(Event::Text(ref e)) => {
                     if in_v {
                         text_out.push_str(e.as_ref());
-                        text_out.push(' ');
                     }
                 }
                 Ok(Event::GeneralRef(ref r)) => {
                     if in_v {
                         text_out.push_str(&decoded_ref(r));
-                        text_out.push(' ');
                     }
                 }
                 Ok(Event::Eof) => break,
@@ -336,17 +345,19 @@ pub fn extract_epub(path: &Path, max_bytes: usize) -> Option<String> {
             match reader.read_event_into(&mut buf) {
                 Ok(Event::Text(ref e)) => {
                     text_out.push_str(e.as_ref());
-                    text_out.push(' ');
                 }
                 Ok(Event::GeneralRef(ref r)) => {
                     text_out.push_str(&decoded_ref(r));
-                    text_out.push(' ');
                 }
                 Ok(Event::End(ref e)) => {
                     let name = e.name();
-                    let tag = name.as_ref();
-                    if tag == "p" || tag == "h1" || tag == "h2" || tag == "h3" {
-                        text_out.push('\n');
+                    let local = name.as_ref().rsplit(':').next().unwrap_or("");
+                    if local == "p" || local == "h1" || local == "h2" || local == "h3" {
+                        if !text_out.ends_with('\n') {
+                            text_out.push('\n');
+                        }
+                    } else if !text_out.is_empty() && !text_out.ends_with([' ', '\n']) {
+                        text_out.push(' ');
                     }
                 }
                 Ok(Event::Eof) => break,
@@ -386,17 +397,19 @@ pub fn extract_odt(path: &Path, max_bytes: usize) -> Option<String> {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Text(ref e)) => {
                 text_out.push_str(e.as_ref());
-                text_out.push(' ');
             }
             Ok(Event::GeneralRef(ref r)) => {
                 text_out.push_str(&decoded_ref(r));
-                text_out.push(' ');
             }
             Ok(Event::End(ref e)) => {
                 let name = e.name();
                 let tag = name.as_ref();
                 if tag == "text:p" || tag == "text:h" {
-                    text_out.push('\n');
+                    if !text_out.ends_with('\n') {
+                        text_out.push('\n');
+                    }
+                } else if !text_out.is_empty() && !text_out.ends_with([' ', '\n']) {
+                    text_out.push(' ');
                 }
             }
             Ok(Event::Eof) => break,

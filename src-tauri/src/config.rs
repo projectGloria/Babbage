@@ -208,7 +208,7 @@ pub struct BabbageConfig {
     /// system locale. Added in v7.
     #[serde(default)]
     pub language: Option<String>,
-    /// Personal vocabulary: `term` matches any of `expansions`.</arg_value>
+    /// Personal vocabulary: `term` matches any of `expansions`.
     #[serde(default = "default_aliases")]
     pub aliases: Vec<Alias>,
     /// Saved queries shown on the home screen.
@@ -269,9 +269,7 @@ fn resolve_config_dir(
         return PathBuf::from(dir);
     }
     if let Some(exe_dir) = exe_path.and_then(std::path::Path::parent)
-        && (exe_dir.join("portable").is_file()
-            || exe_dir.join("babbage.portable").is_file()
-            || exe_dir.join("babbage.portable").is_file())
+        && (exe_dir.join("portable").is_file() || exe_dir.join("babbage.portable").is_file())
     {
         return exe_dir.join("data");
     }
@@ -499,7 +497,7 @@ impl BabbageConfig {
     ///    sits next to the executable, everything lives in `<exe_dir>/data`.
     /// 3. The platform default (`~/.config/babbage`, `%APPDATA%\\babbage`, …).
     pub fn config_dir() -> PathBuf {
-        let env_dir = std::env::var_os("BABBAGE_DATA_DIR").or_else(|| std::env::var_os("BABBAGE_DATA_DIR"));
+        let env_dir = std::env::var_os("BABBAGE_DATA_DIR");
         let exe_path = std::env::current_exe().ok();
         resolve_config_dir(env_dir.as_deref(), exe_path.as_deref(), dirs::config_dir())
     }
@@ -543,7 +541,7 @@ impl BabbageConfig {
             // images were never indexed. Normalize before comparing.
             const NOW_INDEXABLE: &[&str] = &[
                 "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "epub", "odt", "ods", "odp",
-                "rtf", "png", "jpg", "jpeg", "gif", "bmp", "webp", "tiff", "tif",
+                "rtf", "png", "jpg", "jpeg", "gif", "bmp", "ico", "webp", "tiff", "tif",
             ];
             cfg.excluded_extensions.retain(|ext| {
                 let normalized = ext.trim_start_matches('.').to_ascii_lowercase();

@@ -228,11 +228,19 @@ pub fn info(message: &str) {
 /// log can hold both. The timestamp prefix is bracketed and comes first;
 /// everything after it is the message.
 fn is_failure_line(line: &str) -> bool {
-    let body = match line.find(']') {
-        Some(end) => line[end + 1..].trim_start(),
-        None => line.trim_start(),
+    let trimmed = line.trim_start();
+    let Some(rest) = trimmed.strip_prefix('[') else {
+        return false;
     };
-    !body.starts_with("INFO ")
+    let Some(end) = rest.find(']') else {
+        return false;
+    };
+    let stamp = &rest[..end];
+    if stamp.is_empty() || !stamp.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    let body = rest[end + 1..].trim_start();
+    !body.is_empty() && !body.starts_with("INFO ")
 }
 
 /// The most recent line in the crash log that describes an actual failure.

@@ -8,7 +8,7 @@ import { useEffect, useState } from "react";
 
 /** Extensions the backend thumbnailer handles. Everything else never asks. */
 const THUMB_EXTS = new Set([
-  "png", "jpg", "jpeg", "gif", "webp", "bmp", "tiff", "tif",
+  "png", "jpg", "jpeg", "gif", "webp", "bmp", "tiff", "tif", "ico",
   "pdf",
 ]);
 
@@ -36,8 +36,31 @@ export interface ThumbnailState {
    IPC. Bounded LRU (Map keeps insertion order); in-flight requests are
    shared so a card and the preview never fetch the same path twice. */
 const CACHE_LIMIT = 400;
+const MAX_CONCURRENT = 6;
 const cache = new Map<string, string>();
 const inflight = new Map<string, Promise<string | null>>();
+let activeCount = 0;
+const waitQueue: Array<() => void> = [];
+
+function runLimited<T>(fn: () => Promise<T>): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const start = () => {
+      activeCount += 1;
+      fn()
+        .then(resolve, reject)
+        .finally(() => {
+          activeCount -= 1;
+          const next = waitQueue.shift();
+          if (next) next();
+        });
+    };
+    if (activeCount < MAX_CONCURRENT) {
+      start();
+    } else {
+      waitQueue.push(start);
+    }
+  });
+}
 
 function cached(path: string): string | null {
   const hit = cache.get(path);
@@ -58,7 +81,7 @@ function remember(path: string, dataUrl: string) {
 function fetchThumbnail(path: string): Promise<string | null> {
   const pending = inflight.get(path);
   if (pending) return pending;
-  const request = invoke<string | null>("get_thumbnail_data", { path })
+  const request = runLimited(() => invoke<string | null>("get_thumbnail_data", { path }))
     .then((dataUrl) => {
       if (dataUrl) remember(path, dataUrl);
       return dataUrl;
@@ -86,27 +109,35 @@ export function useThumbnail(path: string, enabled: boolean): ThumbnailState {
   const [failed, setFailed] = useState(false);
 
   useEffect(() => {
-    if (!thumbable) return;
+    setFailed(false);
+    if (!thumbable) {
+      setSrc(null);
+      return;
+    }
     const hit = cached(path);
     if (hit) {
       setSrc(hit);
       return;
     }
+    setSrc(null);
     let cancelled = false;
-    fetchThumbnail(path)
-      .then((dataUrl) => {
-        if (cancelled) return;
-        if (dataUrl) {
-          setSrc(dataUrl);
-        } else {
-          setFailed(true);
-        }
-      })
-      .catch(() => {
-        if (!cancelled) setFailed(true);
-      });
+    const timer = window.setTimeout(() => {
+      fetchThumbnail(path)
+        .then((dataUrl) => {
+          if (cancelled) return;
+          if (dataUrl) {
+            setSrc(dataUrl);
+          } else {
+            setFailed(true);
+          }
+        })
+        .catch(() => {
+          if (!cancelled) setFailed(true);
+        });
+    }, 30);
     return () => {
       cancelled = true;
+      window.clearTimeout(timer);
     };
   }, [path, thumbable]);
 

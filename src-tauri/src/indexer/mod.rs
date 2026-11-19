@@ -11,7 +11,7 @@ pub mod watcher;
 
 use crate::config::BabbageConfig;
 use crate::embed::units::chunk_text;
-use crate::embed::{EMBEDDING_DIM, EmbeddingQueue, ModelRegistry, Unit, UnitStore};
+use crate::embed::{EmbeddingQueue, ModelRegistry, Unit, UnitStore};
 use crate::indexer::content::{
     ContentIndex, is_indexable_extension, is_indexable_file_name, read_text_content_checked,
 };
@@ -165,13 +165,14 @@ fn start_phash_backfill(
     visual_store: Arc<RwLock<crate::embed::visual::VisualStore>>,
     crawl_running: Arc<AtomicBool>,
     query_in_flight: Arc<crate::util::pools::QueryFlag>,
+    data_dir: PathBuf,
 ) {
     if PHASH_BACKFILL_RUNNING.swap(true, Ordering::SeqCst) {
         return;
     }
 
     thread::spawn(move || {
-        let thumbs_dir = BabbageConfig::config_dir().join("thumbs");
+        let thumbs_dir = data_dir.join("thumbs");
         struct ResetOnExit;
         impl Drop for ResetOnExit {
             fn drop(&mut self) {
@@ -309,7 +310,7 @@ impl IndexerManager {
 
         let metadata_store = Arc::new(RwLock::new(MetadataStore::without_db()));
         let content_index = Arc::new(RwLock::new(None));
-        let unit_store = Arc::new(RwLock::new(UnitStore::new(EMBEDDING_DIM)));
+        let unit_store = Arc::new(RwLock::new(UnitStore::new(ModelRegistry::global().dim)));
         let visual_store = Arc::new(RwLock::new(crate::embed::visual::VisualStore::new(
             crate::embed::visual::VISUAL_DIM,
             crate::embed::visual::MOCK_VISUAL_MODEL_ID,
@@ -465,6 +466,11 @@ impl IndexerManager {
                 }
 
                 let files_count = loaded_metadata.len();
+                let content_count = content_index_arc
+                    .read()
+                    .as_ref()
+                    .map(|index| index.num_docs() as usize)
+                    .unwrap_or(0);
                 *metadata.write() = loaded_metadata;
 
                 is_loaded.store(true, Ordering::SeqCst);
@@ -472,6 +478,7 @@ impl IndexerManager {
                 {
                     let mut st = status.write();
                     st.files_indexed = files_count;
+                    st.content_indexed = content_count;
                     st.units_indexed = units_count;
                     st.semantic_ready = units_count > 0;
                     st.current_status = "Idle".to_string();
@@ -522,7 +529,7 @@ impl IndexerManager {
 
         let metadata_store = Arc::new(RwLock::new(MetadataStore::without_db()));
         let content_index = Arc::new(RwLock::new(None));
-        let unit_store = Arc::new(RwLock::new(UnitStore::new(EMBEDDING_DIM)));
+        let unit_store = Arc::new(RwLock::new(UnitStore::new(ModelRegistry::global().dim)));
         let visual_store = Arc::new(RwLock::new(crate::embed::visual::VisualStore::new(
             crate::embed::visual::VISUAL_DIM,
             crate::embed::visual::MOCK_VISUAL_MODEL_ID,
@@ -603,6 +610,11 @@ impl IndexerManager {
                     let _ = db.load_visual_units_into(&mut vstore);
                 }
                 let files_count = loaded_metadata.len();
+                let content_count = content_index_arc
+                    .read()
+                    .as_ref()
+                    .map(|index| index.num_docs() as usize)
+                    .unwrap_or(0);
                 *metadata.write() = loaded_metadata;
 
                 is_loaded.store(true, Ordering::SeqCst);
@@ -610,6 +622,7 @@ impl IndexerManager {
                 {
                     let mut st = status.write();
                     st.files_indexed = files_count;
+                    st.content_indexed = content_count;
                     st.units_indexed = units_count;
                     st.semantic_ready = units_count > 0;
                     st.current_status = "Daemon-backed (read-only client)".to_string();
@@ -641,11 +654,18 @@ impl IndexerManager {
         // component. Counts are throttled to ~10 per second; any change of
         // phase, indexing or paused state is always sent.
         {
-            static LAST: Mutex<Option<(Instant, String, bool, bool)>> = Mutex::new(None);
+            static LAST: Mutex<Option<(Instant, String, bool, bool, bool, bool)>> =
+                Mutex::new(None);
             let mut last = LAST.lock();
-            let state_changed = last.as_ref().is_none_or(|(_, phase, indexing, paused)| {
-                *phase != status.phase || *indexing != status.is_indexing || *paused != status.paused
-            });
+            let state_changed = last.as_ref().is_none_or(
+                |(_, phase, indexing, paused, embedding, semantic_ready)| {
+                    *phase != status.phase
+                        || *indexing != status.is_indexing
+                        || *paused != status.paused
+                        || *embedding != status.is_embedding
+                        || *semantic_ready != status.semantic_ready
+                },
+            );
             let due = last
                 .as_ref()
                 .is_none_or(|(at, ..)| at.elapsed() >= Duration::from_millis(100));
@@ -657,6 +677,8 @@ impl IndexerManager {
                 status.phase.clone(),
                 status.is_indexing,
                 status.paused,
+                status.is_embedding,
+                status.semantic_ready,
             ));
         }
         if let Some(handle) = app_handle.read().as_ref() {
@@ -810,6 +832,7 @@ impl IndexerManager {
         let crawl_start_unix_ms = Arc::clone(&self.crawl_start_unix_ms);
         let last_reconcile_unix_secs = Arc::clone(&self.last_reconcile_unix_secs);
         let watcher_ok = Arc::clone(&self.watcher_ok);
+        let data_dir = self.data_dir.clone();
 
         thread::spawn(move || {
             // A panic anywhere in the crawl (an extractor, a rayon scope, an
@@ -1046,11 +1069,23 @@ impl IndexerManager {
                     let id_vec: Vec<u64> = ids.iter().copied().collect();
                     if let Some(db) = metadata.read().db() {
                         let _ = db.delete_units_for_nodes(&id_vec);
-                        let _ = db.delete_visual_units_for_nodes(&id_vec);
                     }
                     unit_store.write().remove_units_for_nodes(&ids);
-                    for id in &ids {
-                        visual_store.write().remove_node(*id);
+                }
+
+                let visual_ids: HashSet<u64> = to_extract
+                    .iter()
+                    .filter(|job| job.phash_needs_refresh && job.node_id > 0)
+                    .map(|job| job.node_id)
+                    .collect();
+                if !visual_ids.is_empty() {
+                    let vid_vec: Vec<u64> = visual_ids.iter().copied().collect();
+                    if let Some(db) = metadata.read().db() {
+                        let _ = db.delete_visual_units_for_nodes(&vid_vec);
+                    }
+                    let mut vs = visual_store.write();
+                    for id in &visual_ids {
+                        vs.remove_node(*id);
                     }
                 }
             }
@@ -1078,7 +1113,7 @@ impl IndexerManager {
                 let ids: Vec<u64> = to_extract.iter().map(|job| job.node_id).collect();
                 let _ = db.set_pending_by_ids(&ids, true);
             }
-            let thumbs_dir = BabbageConfig::config_dir().join("thumbs");
+            let thumbs_dir = data_dir.join("thumbs");
             // The producer task runs on the rayon pool and must own its handles;
             // the consumer (this thread) keeps using the originals.
             let producer_status = Arc::clone(&status);
@@ -1542,13 +1577,19 @@ impl IndexerManager {
                 }
             }
 
+            let total_content_docs = content_index
+                .read()
+                .as_ref()
+                .map(|c| c.num_docs() as usize)
+                .unwrap_or(content_count);
+
             {
                 let mut st = status.write();
                 st.is_indexing = false;
                 st.paused = false;
                 st.phase = "idle".to_string();
                 st.files_indexed = files_count;
-                st.content_indexed = content_count;
+                st.content_indexed = total_content_docs;
                 st.current_status = format!("Ready ({} files indexed)", files_count);
                 Self::emit_status(&app_handle, &st);
             }
@@ -1603,6 +1644,7 @@ impl IndexerManager {
                 Arc::clone(&visual_store),
                 Arc::clone(&is_running),
                 Arc::clone(&query_in_flight),
+                data_dir,
             );
         });
     }
@@ -1717,7 +1759,7 @@ impl IndexerManager {
         self.unit_store.write().clear();
         self.visual_store.write().clear();
 
-        let index_dir = BabbageConfig::index_dir();
+        let index_dir = self.data_dir.join("index");
         // Deleting the directory reclaims the old segments outright. If a
         // just-dropped mmap still holds a file (Windows), the fresh handle
         // opens the stale index and `truncate` purges it logically instead.
@@ -1763,7 +1805,7 @@ impl IndexerManager {
 
         // Thumbnails are derived data and regenerate during the crawl.
         // Best-effort: files still open for a read are simply skipped.
-        let _ = std::fs::remove_dir_all(BabbageConfig::config_dir().join("thumbs"));
+        let _ = std::fs::remove_dir_all(self.data_dir.join("thumbs"));
 
         // Hand the empty stores to the normal crawl. Settle first so the
         // guard touches no status, release the gate explicitly (the crawl
@@ -1883,7 +1925,7 @@ impl IndexerManager {
                     "Visual embeddings are not available in this build; install the visual model pack"
                         .to_string()
                 })?;
-                let thumbs_dir = BabbageConfig::config_dir().join("thumbs");
+                let thumbs_dir = self.data_dir.join("thumbs");
                 let thumb = crate::indexer::extract::image::thumbnail_path(path, &thumbs_dir);
                 if thumb.is_file()
                     && let Some(v) = encoder.embed_image_from_thumbnail(&thumb)
@@ -1980,13 +2022,11 @@ impl IndexerManager {
                 "static-embed-256".to_string(),
             )
         };
-        let index_dir = BabbageConfig::index_dir();
-        let index_bytes = dir_size_bytes(&index_dir).saturating_add(prefixed_file_bytes(
-            &BabbageConfig::config_dir(),
-            "metadata.db",
-        ));
+        let index_dir = self.data_dir.join("index");
+        let index_bytes = dir_size_bytes(&index_dir)
+            .saturating_add(prefixed_file_bytes(&self.data_dir, "metadata.db"));
         let last_reconcile = last_modified_secs(&[
-            BabbageConfig::config_dir().join("metadata.db"),
+            self.data_dir.join("metadata.db"),
             index_dir.join("meta.json"),
         ]);
         let status = self.get_status();
@@ -2341,23 +2381,7 @@ fn write_ocr_signature(signature: &str) {
     }
 }
 
-fn dir_size_bytes(dir: &std::path::Path) -> u64 {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return 0;
-    };
-    let mut total = 0u64;
-    for entry in entries.flatten() {
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if file_type.is_dir() {
-            total = total.saturating_add(dir_size_bytes(&entry.path()));
-        } else if file_type.is_file() {
-            total = total.saturating_add(entry.metadata().map(|meta| meta.len()).unwrap_or(0));
-        }
-    }
-    total
-}
+use crate::util::dir_size_bytes;
 
 fn prefixed_file_bytes(dir: &std::path::Path, prefix: &str) -> u64 {
     let Ok(entries) = std::fs::read_dir(dir) else {

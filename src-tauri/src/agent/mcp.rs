@@ -1041,16 +1041,30 @@ pub fn read_snippet_window(
     let match_byte = query
         .map(str::trim)
         .filter(|query| !query.is_empty())
-        .and_then(|query| text.to_lowercase().find(&query.to_lowercase()))
+        .and_then(|query| {
+            regex::RegexBuilder::new(&regex::escape(query))
+                .case_insensitive(true)
+                .build()
+                .ok()
+                .and_then(|re| re.find(text))
+                .map(|m| m.start())
+        })
         .unwrap_or(0)
         .min(text.len());
 
-    // Keep a little context before the match, then fill the rest of the budget
-    // after it.
-    let mut start = match_byte.saturating_sub(cap_chars / 4);
-    while start > 0 && !text.is_char_boundary(start) {
-        start -= 1;
-    }
+    // Keep a little context (measured in characters, not bytes) before the match,
+    // then fill the rest of the budget after it.
+    let lookback = cap_chars / 4;
+    let start = if lookback == 0 {
+        match_byte
+    } else {
+        text[..match_byte]
+            .char_indices()
+            .rev()
+            .nth(lookback - 1)
+            .map(|(idx, _)| idx)
+            .unwrap_or(0)
+    };
 
     let mut end = start;
     for (chars, (offset, ch)) in text[start..].char_indices().enumerate() {

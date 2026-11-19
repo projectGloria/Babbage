@@ -90,7 +90,7 @@ impl IgnoreSet {
                     continue;
                 }
                 if let Ok(raw) = std::fs::read_to_string(&file) {
-                    let rules = parse(&raw);
+                    let rules = parse(&raw, set.case_insensitive);
                     if !rules.is_empty() {
                         set.rules.entry(dir.clone()).or_default().extend(rules);
                     }
@@ -149,10 +149,11 @@ impl IgnoreSet {
 
             // Parent directories: if any parent prefix is ignored (as a
             // directory), the whole subtree is ignored and cannot be
-            // re-included (git semantics).
+            // re-included (git semantics). Negated rules (`!dir/`) evaluate to
+            // `Some(false)`, so they must not exclude the directory's children.
             for depth in 1..components.len() {
                 let prefix = components[..depth].join("/");
-                if self.evaluate(rules, &prefix, true) {
+                if self.evaluate_last(rules, &prefix, true) == Some(true) {
                     return true;
                 }
             }
@@ -179,17 +180,8 @@ impl IgnoreSet {
         decision
     }
 
-    /// True when any rule matches (used for parent prefixes, where git says
-    /// an excluded directory cannot be re-included from below).
-    fn evaluate(&self, rules: &[Rule], relative: &str, is_dir: bool) -> bool {
-        rules
-            .iter()
-            .any(|rule| self.rule_matches(rule, relative, is_dir))
-    }
-
     fn rule_matches(&self, rule: &Rule, relative: &str, is_dir: bool) -> bool {
-        if rule.dir_only && !is_dir && !relative.contains('/') {
-            // A dir-only pattern never matches a file by its own basename…
+        if rule.dir_only && !is_dir {
             return false;
         }
         let candidate: Cow<'_, str> = if rule.anchored {
@@ -210,7 +202,7 @@ fn normalize_component(component: &str, case_insensitive: bool) -> String {
     }
 }
 
-fn parse(raw: &str) -> Vec<Rule> {
+fn parse(raw: &str, case_insensitive: bool) -> Vec<Rule> {
     let mut rules = Vec::new();
     for line in raw.lines() {
         let line = line.trim_end();
@@ -238,6 +230,11 @@ fn parse(raw: &str) -> Vec<Rule> {
         // trailing one is stripped, so anchoring stays correct.
         let anchored = pattern.contains('/');
         let pattern = pattern.strip_prefix('/').unwrap_or(&pattern).to_string();
+        let pattern = if case_insensitive {
+            pattern.to_lowercase()
+        } else {
+            pattern
+        };
         rules.push(Rule {
             pattern,
             negated,

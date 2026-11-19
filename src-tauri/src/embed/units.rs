@@ -111,6 +111,12 @@ impl UnitStore {
     }
 
     pub fn add_unit(&mut self, unit: Unit, vector: &[i8]) {
+        if vector.is_empty() {
+            return;
+        }
+        if self.dim == 0 {
+            self.dim = vector.len();
+        }
         if vector.len() != self.dim {
             return;
         }
@@ -191,6 +197,9 @@ impl UnitStore {
         self.units = new_units;
         self.vectors = new_vectors;
         self.node_to_units = new_node_to_units;
+        if self.units.is_empty() {
+            self.dim = crate::embed::ModelRegistry::global().dim;
+        }
     }
 
     pub fn len(&self) -> usize {

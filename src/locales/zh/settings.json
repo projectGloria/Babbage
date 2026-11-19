@@ -210,6 +210,9 @@
   "about": {
     "resetPending": "有一个待处理的重置，将在下次启动时完成。",
     "version": "版本",
+    "tagline": "完全本地化的搜索引擎。离线且私密。",
+    "badgeLocal": "本地",
+    "badgeOffline": "离线",
     "autoUpdate": "默认启用自动检查更新。",
     "checkUpdates": "检查更新",
     "opening": "正在打开…",

@@ -171,8 +171,12 @@ export function SetupModal({ onSetupCompleted }: { onSetupCompleted: () => void 
       setShortcut(parts.join("+"));
       setCapturing(false);
     };
+    document.body.dataset.ksCapture = "1";
     window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    return () => {
+      delete document.body.dataset.ksCapture;
+      window.removeEventListener("keydown", onKey);
+    };
   }, [capturing]);
 
   // Load OCR state when the final screen opens. The selection mirrors the

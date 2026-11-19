@@ -30,10 +30,15 @@ const STD: [f32; 3] = [0.229, 0.224, 0.225];
 
 fn preprocess(image: &DynamicImage) -> Result<(Vec<f32>, i64, i64, f32, f32), PaddleOcrError> {
     let (w, h) = (image.width(), image.height());
+    if w == 0 || h == 0 {
+        return Err(PaddleOcrError::Image {
+            message: "Image has zero dimensions".to_string(),
+        });
+    }
     let scale = DET_LONG_SIDE as f32 / w.max(h) as f32;
     let scale = scale.min(1.0);
-    let new_w = (w as f32 * scale) as u32;
-    let new_h = (h as f32 * scale) as u32;
+    let new_w = ((w as f32 * scale) as u32).max(1);
+    let new_h = ((h as f32 * scale) as u32).max(1);
 
     let resized = image.resize_exact(new_w, new_h, image::imageops::FilterType::Triangle);
     let pad_w = (32 - new_w % 32) % 32;
@@ -212,7 +217,7 @@ fn unclip_box(poly: &[[f32; 2]; 4], ratio: f32) -> Option<Vec<[f32; 2]>> {
     let largest = buffered
         .0
         .iter()
-        .max_by(|a, b| a.unsigned_area().partial_cmp(&b.unsigned_area()).unwrap())?;
+        .max_by(|a, b| a.unsigned_area().total_cmp(&b.unsigned_area()))?;
     let rect = largest.minimum_rotated_rect()?;
     let box_points = polygon_to_box(&rect)?;
     Some(box_points.into_iter().collect())

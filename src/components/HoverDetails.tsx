@@ -27,6 +27,10 @@ export function HoverDetails({
   const [details, setDetails] = useState<Details>({});
 
   useEffect(() => {
+    setDetails({});
+  }, [result.path]);
+
+  useEffect(() => {
     // Dimensions cost an IPC round trip per file, so they are fetched on
     // hover, as the docstring above promises, not for every mounted card.
     if (!active || details.width || details.height) return;

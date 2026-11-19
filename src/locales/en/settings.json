@@ -210,6 +210,9 @@
   "about": {
     "resetPending": "A reset is pending and will finish on next launch.",
     "version": "Version",
+    "tagline": "Completely local search engine. Offline & private.",
+    "badgeLocal": "Local",
+    "badgeOffline": "Offline",
     "autoUpdate": "Automatic update checking is enabled by default.",
     "checkUpdates": "Check for updates",
     "opening": "Opening…",

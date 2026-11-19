@@ -11,6 +11,7 @@
     "content": "file content",
     "contentFolded": "content (fuzzy)",
     "semantic": "meaning",
+    "visual": "image similarity",
     "both": "name and content"
   },
   "preview": {

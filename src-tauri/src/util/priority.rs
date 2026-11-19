@@ -61,29 +61,30 @@ fn apply_platform(background: bool) {
 
 #[cfg(target_os = "macos")]
 fn apply_platform(background: bool) {
+    const PRIO_DARWIN_THREAD: libc::c_int = 3;
     let priority = if background { libc::PRIO_DARWIN_BG } else { 0 };
     unsafe {
-        let _ = libc::setpriority(libc::PRIO_DARWIN_PROCESS, 0, priority);
+        let _ = libc::setpriority(PRIO_DARWIN_THREAD, 0, priority);
     }
 }
 
 #[cfg(windows)]
 fn apply_platform(background: bool) {
-    const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
-    const NORMAL_PRIORITY_CLASS: u32 = 0x0000_0020;
+    const THREAD_PRIORITY_BELOW_NORMAL: i32 = -1;
+    const THREAD_PRIORITY_NORMAL: i32 = 0;
 
     unsafe extern "system" {
-        fn GetCurrentProcess() -> *mut core::ffi::c_void;
-        fn SetPriorityClass(process: *mut core::ffi::c_void, class: u32) -> i32;
+        fn GetCurrentThread() -> *mut core::ffi::c_void;
+        fn SetThreadPriority(thread: *mut core::ffi::c_void, priority: i32) -> i32;
     }
 
-    let class = if background {
-        BELOW_NORMAL_PRIORITY_CLASS
+    let priority = if background {
+        THREAD_PRIORITY_BELOW_NORMAL
     } else {
-        NORMAL_PRIORITY_CLASS
+        THREAD_PRIORITY_NORMAL
     };
     unsafe {
-        let _ = SetPriorityClass(GetCurrentProcess(), class);
+        let _ = SetThreadPriority(GetCurrentThread(), priority);
     }
 }
 

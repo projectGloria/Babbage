@@ -108,3 +108,9 @@ export function displayParent(path: string): string {
   const segs = p.split("/");
   return segs.length > 4 ? `${segs[0]}/…/${segs.slice(-2).join("/")}` : p || "/";
 }
+
+export function fileUri(path: string): string {
+  const normalized = path.replace(/\\/g, "/");
+  const encoded = encodeURI(normalized).replace(/#/g, "%23").replace(/\?/g, "%3F");
+  return normalized.startsWith("/") ? `file://${encoded}` : `file:///${encoded}`;
+}

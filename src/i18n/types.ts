@@ -1,7 +1,6 @@
 import "i18next";
 import common from "../locales/en/common.json";
 import search from "../locales/en/search.json";
-import home from "../locales/en/home.json";
 import results from "../locales/en/results.json";
 import details from "../locales/en/details.json";
 import help from "../locales/en/help.json";
@@ -15,7 +14,6 @@ declare module "i18next" {
     resources: {
       common: typeof common;
       search: typeof search;
-      home: typeof home;
       results: typeof results;
       details: typeof details;
       help: typeof help;
