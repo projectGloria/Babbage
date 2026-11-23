@@ -1,0 +1,8 @@
+id = "Babbage"
+name = "Babbage"
+version = "1.1.2"
+main_exe = "babbage.exe"
+icon = "src-tauri/icons/icon.ico"
+accent = "#6366F1"
+description = "Blazing-fast local file and content search."
+data_folders = ['%APPDATA%\babbage', '%LOCALAPPDATA%\babbage']

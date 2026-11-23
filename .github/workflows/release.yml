@@ -2,22 +2,18 @@ name: Release
 
 on:
   push:
-    tags:
-      - 'v*'
+    branches:
+      - main
   workflow_dispatch:
     inputs:
-      tag:
-        description: 'Release tag (e.g. v1.1.1). Defaults to v<version from package.json>.'
+      dry_run:
+        description: 'Build and verify installer without publishing a GitHub Release'
         required: false
-        type: string
-      draft:
-        description: 'Create release as a draft'
-        required: false
-        default: false
+        default: true
         type: boolean
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
@@ -29,111 +25,91 @@ env:
   NUGET_ORT_URL: 'https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/1.31.0/microsoft.ml.onnxruntime.1.31.0.nupkg'
 
 jobs:
-  build:
-    name: Build (${{ matrix.label }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - label: linux-x64
-            os: ubuntu-22.04
-            platform: linux
-            arch: x64
-            rust_target: x86_64-unknown-linux-gnu
-            rust_targets: ''
-            ort_rid: linux-x64
-            ort_lib: libonnxruntime.so
-            ort_config: src-tauri/tauri.onnxruntime.linux.conf.json
-            tauri_args: '--config src-tauri/tauri.onnxruntime.linux.conf.json'
-            bundle_dir: src-tauri/target/release/bundle
-            cli_name: babbage-cli-linux-x86_64
-
-          - label: macos-universal
-            os: macos-latest
-            platform: macos
-            arch: universal
-            rust_target: universal-apple-darwin
-            rust_targets: 'aarch64-apple-darwin,x86_64-apple-darwin'
-            ort_rid: osx-arm64
-            ort_lib: libonnxruntime.dylib
-            ort_config: src-tauri/tauri.onnxruntime.macos.conf.json
-            tauri_args: '--target universal-apple-darwin --config src-tauri/tauri.onnxruntime.macos.conf.json'
-            bundle_dir: src-tauri/target/universal-apple-darwin/release/bundle
-            cli_name: babbage-cli-macos-arm64
-
-          - label: windows-x64
-            os: windows-latest
-            platform: windows
-            arch: x64
-            rust_target: x86_64-pc-windows-msvc
-            rust_targets: ''
-            ort_rid: win-x64
-            ort_lib: onnxruntime.dll
-            ort_config: src-tauri/tauri.onnxruntime.windows.conf.json
-            tauri_args: '--target x86_64-pc-windows-msvc --config src-tauri/tauri.onnxruntime.windows.conf.json'
-            bundle_dir: src-tauri/target/x86_64-pc-windows-msvc/release/bundle
-            cli_name: babbage-cli-windows-x86_64.exe
-
-          - label: windows-arm64
-            os: windows-11-arm
-            platform: windows
-            arch: arm64
-            rust_target: aarch64-pc-windows-msvc
-            rust_targets: ''
-            ort_rid: win-arm64
-            ort_lib: onnxruntime.dll
-            ort_config: src-tauri/tauri.onnxruntime.windows.conf.json
-            tauri_args: '--target aarch64-pc-windows-msvc --config src-tauri/tauri.onnxruntime.windows.conf.json'
-            bundle_dir: src-tauri/target/aarch64-pc-windows-msvc/release/bundle
-            cli_name: babbage-cli-windows-aarch64.exe
-
+  version:
+    name: Detect version bump
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      build: ${{ steps.check.outputs.build }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
 
-      - name: Install Linux Tauri and bundler dependencies
-        if: matrix.platform == 'linux'
+      - name: Read and verify version
+        id: check
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            libgtk-3-dev \
-            patchelf \
-            rpm \
-            libfuse2
+          set -euo pipefail
+          GLORIA_VER=$(grep -E '^version\s*=' gloria.toml | head -n1 | sed -E 's/^version\s*=\s*"([^"]+)".*/\1/')
+          PKG_VER=$(node -p "require('./package.json').version")
+          TAURI_VER=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          CARGO_VER=$(grep -E '^version\s*=' src-tauri/Cargo.toml | head -n1 | sed -E 's/^version\s*=\s*"([^"]+)".*/\1/')
 
-      - uses: actions/setup-node@v4
+          if [[ -z "$GLORIA_VER" ]]; then
+            echo "Failed to parse version from gloria.toml" >&2
+            exit 1
+          fi
+          if [[ "$GLORIA_VER" != "$PKG_VER" || "$GLORIA_VER" != "$TAURI_VER" || "$GLORIA_VER" != "$CARGO_VER" ]]; then
+            echo "Version mismatch: gloria.toml=$GLORIA_VER package.json=$PKG_VER tauri.conf.json=$TAURI_VER src-tauri/Cargo.toml=$CARGO_VER" >&2
+            exit 1
+          fi
+
+          echo "version=${GLORIA_VER}" >> "$GITHUB_OUTPUT"
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          BEFORE="${{ github.event.before }}"
+          if [[ -z "$BEFORE" || "$BEFORE" == "0000000000000000000000000000000000000000" ]]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          PREV_VER=$(git show "${BEFORE}:gloria.toml" 2>/dev/null | grep -E '^version\s*=' | head -n1 | sed -E 's/^version\s*=\s*"([^"]+)".*/\1/' || true)
+          if [[ "$GLORIA_VER" != "$PREV_VER" ]]; then
+            echo "Version changed: ${PREV_VER:-<none>} -> ${GLORIA_VER}"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Version unchanged (${GLORIA_VER}); skipping release build."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build Windows x64 installer
+    needs: version
+    if: needs.version.outputs.build == 'true'
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: npm
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.rust_targets }}
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
 
-      - uses: Swatinem/rust-cache@v2
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: |
             src-tauri -> target
-            cli -> target
 
-      - name: Install frontend dependencies
-        run: npm ci
-
-      - name: Fetch ONNX Runtime shared library (Unix)
-        if: matrix.platform != 'windows'
-        shell: bash
+      - name: Install frontend dependencies and build
+        shell: pwsh
         run: |
-          set -euo pipefail
-          curl -fsSL "$NUGET_ORT_URL" -o /tmp/ort.nupkg
-          unzip -j -o /tmp/ort.nupkg "runtimes/${{ matrix.ort_rid }}/native/${{ matrix.ort_lib }}" -d src-tauri/
-          rm -f /tmp/ort.nupkg
-          ls -lh "src-tauri/${{ matrix.ort_lib }}"
+          $ErrorActionPreference = 'Stop'
+          npm ci
+          npm run build
 
-      - name: Fetch ONNX Runtime shared library (Windows)
-        if: matrix.platform == 'windows'
+      - name: Fetch ONNX Runtime shared library
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -142,121 +118,109 @@ jobs:
           Add-Type -AssemblyName System.IO.Compression.FileSystem
           $zip = [System.IO.Compression.ZipFile]::OpenRead($nupkg)
           try {
-            $entryPath = "runtimes/${{ matrix.ort_rid }}/native/${{ matrix.ort_lib }}"
+            $entryPath = 'runtimes/win-x64/native/onnxruntime.dll'
             $entry = $zip.GetEntry($entryPath)
             if (-not $entry) { throw "Missing entry $entryPath in ONNX Runtime package" }
-            $dest = Join-Path (Resolve-Path 'src-tauri') '${{ matrix.ort_lib }}'
+            $dest = Join-Path (Resolve-Path 'src-tauri') 'onnxruntime.dll'
             [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $dest, $true)
           } finally {
             $zip.Dispose()
             Remove-Item -Force $nupkg
           }
-          Get-Item "src-tauri/${{ matrix.ort_lib }}"
+          Get-Item 'src-tauri/onnxruntime.dll'
 
-      # Signing / notarization (optional — add repository secrets to enable):
-      #   macOS: APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY,
-      #          APPLE_ID, APPLE_PASSWORD, APPLE_TEAM_ID
-      #   Windows: WINDOWS_CERTIFICATE, WINDOWS_CERTIFICATE_PASSWORD
-      - name: Build Tauri installers
-        env:
-          APPIMAGE_EXTRACT_AND_RUN: '1'
-        run: npx tauri build ${{ matrix.tauri_args }}
-
-      - name: Build agent CLI
-        run: cargo build --release --manifest-path cli/Cargo.toml --bin babbage-cli
-
-      - name: Collect release assets (Linux)
-        if: matrix.platform == 'linux'
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p release-assets
-          cp ${{ matrix.bundle_dir }}/deb/*.deb release-assets/
-          cp ${{ matrix.bundle_dir }}/rpm/*.rpm release-assets/
-          cp ${{ matrix.bundle_dir }}/appimage/*.AppImage release-assets/
-          cp cli/target/release/babbage-cli "release-assets/${{ matrix.cli_name }}"
-          ls -lh release-assets/
-
-      - name: Collect release assets (macOS)
-        if: matrix.platform == 'macos'
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p release-assets
-          cp ${{ matrix.bundle_dir }}/dmg/*.dmg release-assets/
-          cp cli/target/release/babbage-cli "release-assets/${{ matrix.cli_name }}"
-          ls -lh release-assets/
-
-      - name: Collect release assets and portable zip (Windows)
-        if: matrix.platform == 'windows'
+      - name: Build Tauri release binary
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
-          New-Item -ItemType Directory -Force -Path release-assets | Out-Null
+          cargo build --release --locked --manifest-path src-tauri/Cargo.toml
 
-          Copy-Item "${{ matrix.bundle_dir }}/nsis/*.exe" release-assets/
-          Copy-Item "${{ matrix.bundle_dir }}/msi/*.msi" release-assets/
-          Copy-Item "cli/target/release/babbage-cli.exe" "release-assets/${{ matrix.cli_name }}"
+      - name: Stage application payload
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (Test-Path app-dist) { Remove-Item -Recurse -Force app-dist }
+          New-Item -ItemType Directory -Force -Path app-dist | Out-Null
+          Copy-Item 'src-tauri/target/release/babbage.exe' 'app-dist/'
+          Copy-Item 'src-tauri/onnxruntime.dll' 'app-dist/'
+          Copy-Item -Recurse 'src-tauri/resources' 'app-dist/resources'
+          Get-ChildItem app-dist
 
-          $portableDir = Join-Path $env:TEMP "babbage-portable-$version-${{ matrix.arch }}"
-          if (Test-Path $portableDir) { Remove-Item -Recurse -Force $portableDir }
-          New-Item -ItemType Directory -Force -Path $portableDir | Out-Null
-          Copy-Item "src-tauri/target/${{ matrix.rust_target }}/release/babbage.exe" $portableDir/
-          Copy-Item "src-tauri/${{ matrix.ort_lib }}" $portableDir/
-          Copy-Item -Recurse "src-tauri/resources" "$portableDir/resources"
-          Compress-Archive -Path "$portableDir/*" -DestinationPath "release-assets/babbage-portable-$version-${{ matrix.arch }}.zip" -Force
+      - name: Pack installer with GloriaSetup
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          npx --yes gloria-setup@0.2.4 --app app-dist --manifest gloria.toml --version ${{ needs.version.outputs.version }} --out dist
 
-          Get-ChildItem release-assets/
+      - name: Verify installer with silent dry-run
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $setup = "dist\Babbage_${{ needs.version.outputs.version }}_x64-setup.exe"
+          if (-not (Test-Path $setup)) { throw "Expected installer not found: $setup" }
+          $proc = Start-Process -FilePath $setup -ArgumentList '/S --dry-run' -Wait -PassThru
+          if ($proc.ExitCode -ne 0) { throw "GloriaSetup dry-run failed with exit code $($proc.ExitCode)" }
 
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: babbage-${{ matrix.label }}
-          path: release-assets/*
+          name: babbage-windows-x64-installer
+          path: dist/Babbage_${{ needs.version.outputs.version }}_x64-setup.exe
+          compression-level: 0
           if-no-files-found: error
 
   publish:
-    name: Create GitHub Release
-    needs: build
+    name: Publish GitHub Release
+    needs: [version, build]
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || !inputs.dry_run)
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
+      - name: Download installer artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: babbage-windows-x64-installer
+          path: release-assets
 
-      - name: Resolve release tag
-        id: meta
+      - name: Generate SHA256SUMS.txt
         shell: bash
         run: |
           set -euo pipefail
-          if [[ "${{ github.event_name }}" == "push" ]]; then
-            TAG="${{ github.ref_name }}"
-          elif [[ -n "${{ inputs.tag }}" ]]; then
-            TAG="${{ inputs.tag }}"
-          else
-            VERSION=$(node -p "require('./package.json').version")
-            TAG="v${VERSION}"
+          cd release-assets
+          sha256sum *_x64-setup.exe > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create, verify, and publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          TAG="v${VERSION}"
+          INSTALLER="Babbage_${VERSION}_x64-setup.exe"
+          PRERELEASE_FLAG=()
+          if [[ "$VERSION" == *-* ]]; then
+            PRERELEASE_FLAG=(--prerelease)
           fi
-          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
 
-      - name: Download all build artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: dist-assets
-          merge-multiple: true
+          gh release create "$TAG" \
+            "release-assets/${INSTALLER}" \
+            "release-assets/SHA256SUMS.txt" \
+            --repo "${{ github.repository }}" \
+            --title "Babbage ${TAG}" \
+            --generate-notes \
+            --draft \
+            "${PRERELEASE_FLAG[@]}"
 
-      - name: Generate SHA256SUMS
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd dist-assets
-          sha256sum * > SHA256SUMS
-          cat SHA256SUMS
+          VERIFY_DIR=$(mktemp -d)
+          gh release download "$TAG" \
+            --repo "${{ github.repository }}" \
+            --dir "$VERIFY_DIR"
+          (cd "$VERIFY_DIR" && sha256sum --check SHA256SUMS.txt)
+          rm -rf "$VERIFY_DIR"
 
-      - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.meta.outputs.tag }}
-          name: Babbage ${{ steps.meta.outputs.tag }}
-          draft: ${{ inputs.draft || false }}
-          generate_release_notes: true
-          files: dist-assets/*
+          gh release edit "$TAG" \
+            --repo "${{ github.repository }}" \
+            --draft=false
